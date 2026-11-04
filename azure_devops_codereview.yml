@@ -1,0 +1,384 @@
+# ============================================================
+# PIPELINE DE CODE REVIEW - LAMBDAQUALITY
+# ============================================================
+# Apenas o stage Automated_Code_Review.
+# Azure Repos Git: o gatilho de PR é configurado por Branch policies,
+# não pelo campo pr do YAML.
+#
+# Após cadastrar esta pipeline com azure_devops_codereview.yml:
+#   Repos > Branches > branch de destino > Branch policies
+#   > Build validation > selecionar esta pipeline > Trigger: Automatic.
+# Repetir em cada branch que recebe PRs; não definir filtros de paths
+# se todas as alterações devem disparar a revisão.
+#
+# O code review continua não bloqueante, como no modelo original.
+# Referência:
+# https://learn.microsoft.com/en-us/azure/devops/pipelines/repos/azure-repos-git?view=azure-devops
+# ============================================================
+
+# Sem execução automática por push; PRs são disparadas pela política.
+trigger: none
+pr: none
+
+parameters:
+  - name: ciPoolName
+    displayName: "Pool de agentes de CI com Docker"
+    type: string
+    default: Default
+
+pool:
+  name: ${{ parameters.ciPoolName }}
+
+variables:
+
+  MEGALINTER_IMAGE: "ghcr.io/oxsecurity/megalinter:v9"
+  MEGALINTER_CODE_REVIEW_DISABLED_DESCRIPTORS: "REPOSITORY"
+  MEGALINTER_CODE_REVIEW_DISABLED_LINTERS: "REPOSITORY_SYFT,REPOSITORY_TRIVY_SBOM,REPOSITORY_TRIVY,REPOSITORY_CHECKOV,REPOSITORY_GITLEAKS,REPOSITORY_SECRETLINT,REPOSITORY_BETTERLEAKS,REPOSITORY_DUSTILOCK,COPYPASTE_JSCPD"
+
+stages:
+
+  # ============================================================
+  # 1. AUTOMATED CODE REVIEW
+  # ============================================================
+
+  - stage: Automated_Code_Review
+
+    displayName: "Automated Code Review"
+
+    dependsOn: []
+
+    jobs:
+
+      - job: MegaLinter
+
+        displayName: "MegaLinter - Revisão automatizada"
+
+        timeoutInMinutes: 20
+
+        steps:
+
+          - checkout: self
+
+            displayName: "Checkout do repositório"
+
+            # O MegaLinter já gerou relatórios como root dentro do
+            # checkout em execuções anteriores. Mantemos clean=false
+            # neste stage para conseguir corrigir a permissão antes
+            # que o Azure DevOps tente executar git clean.
+            clean: false
+            fetchDepth: 0
+            persistCredentials: true
+
+
+          # ----------------------------------------------------
+          # CODE REVIEW AUTOMATIZADO
+          # ----------------------------------------------------
+
+          - bash: |
+              set -euo pipefail
+              
+              REPORT_DIRECTORY="$(Build.ArtifactStagingDirectory)/megalinter-reports"
+              LEGACY_REPORT_DIRECTORY="$(Build.SourcesDirectory)/megalinter-reports"
+              CHANGED_FILES_LIST="$REPORT_DIRECTORY/changed-files.txt"
+              MEGALINTER_FILES_TO_LINT_FILE="$REPORT_DIRECTORY/megalinter-files-to-lint.txt"
+              SOURCE_BRANCH="$(Build.SourceBranch)"
+              TARGET_BRANCH=""
+              
+              if [ -n "${SYSTEM_PULLREQUEST_SOURCEBRANCH:-}" ]; then
+              
+                  SOURCE_BRANCH="$SYSTEM_PULLREQUEST_SOURCEBRANCH"
+              
+              fi
+              
+              if [ -n "${SYSTEM_PULLREQUEST_TARGETBRANCH:-}" ]; then
+              
+                  TARGET_BRANCH="$SYSTEM_PULLREQUEST_TARGETBRANCH"
+              
+              fi
+              
+              mkdir -p "$REPORT_DIRECTORY"
+              
+              echo "=================================================="
+              echo "          AUTOMATED CODE REVIEW"
+              echo "=================================================="
+              echo "Repositório: $(Build.Repository.Name)"
+              echo "Branch: $(Build.SourceBranch)"
+              echo "Branch origem do PR:"
+              echo "  ${SOURCE_BRANCH:-N/A}"
+              echo "Branch destino do PR:"
+              echo "  ${TARGET_BRANCH:-N/A}"
+              echo "Commit: $(Build.SourceVersion)"
+              echo "Imagem: $(MEGALINTER_IMAGE)"
+              echo "Descritores desabilitados neste stage:"
+              echo "  $(MEGALINTER_CODE_REVIEW_DISABLED_DESCRIPTORS)"
+              echo "Linters pesados desabilitados neste stage:"
+              echo "  $(MEGALINTER_CODE_REVIEW_DISABLED_LINTERS)"
+              echo "Modo:"
+              echo "  Incremental, analisando arquivos novos ou alterados"
+              echo "  Não bloqueante para teste inicial"
+              echo "=================================================="
+              echo
+              echo "Obtendo imagem do MegaLinter..."
+              
+              docker pull "$(MEGALINTER_IMAGE)"
+              
+              echo
+              echo "Removendo diretório legado de relatórios dentro do checkout, se existir..."
+              
+              docker run --rm \
+                --volume "$(Build.SourcesDirectory):/workspace" \
+                --entrypoint sh \
+                "$(MEGALINTER_IMAGE)" \
+                -c "rm -rf /workspace/megalinter-reports || true"
+              
+              rm -rf "$LEGACY_REPORT_DIRECTORY" || true
+              
+              echo
+              echo "Calculando arquivos alterados para o code review..."
+              
+              if [ -n "$TARGET_BRANCH" ]; then
+              
+                  TARGET_BRANCH_NAME="${TARGET_BRANCH#refs/heads/}"
+                  TARGET_REMOTE_REF="origin/$TARGET_BRANCH_NAME"
+              
+                  echo "Execução em contexto de Pull Request."
+                  echo "Origem:"
+                  echo "  $SOURCE_BRANCH"
+                  echo "Destino:"
+                  echo "  $TARGET_BRANCH"
+              
+                  git fetch origin \
+                    "+refs/heads/$TARGET_BRANCH_NAME:refs/remotes/origin/$TARGET_BRANCH_NAME"
+              
+                  git diff \
+                    --name-only \
+                    --diff-filter=ACMRT \
+                    "$TARGET_REMOTE_REF...HEAD" \
+                    > "$CHANGED_FILES_LIST"
+              
+              else
+              
+                  echo "##vso[task.logissue type=warning]Execução fora de Pull Request. Usando arquivos alterados no último commit como fallback."
+              
+                  git diff-tree \
+                    --no-commit-id \
+                    --name-only \
+                    --diff-filter=ACMRT \
+                    -r HEAD \
+                    > "$CHANGED_FILES_LIST"
+              
+              fi
+              
+              grep -Ev '(^|/)(bin|obj)/|(^|/)megalinter-reports/' \
+                "$CHANGED_FILES_LIST" \
+                | grep -E '\.(cs|csproj|sln|config|xml|json|yaml|yml|md|css|scss|html|htm|js|ts|sql)$' \
+                | sort -u \
+                > "$MEGALINTER_FILES_TO_LINT_FILE" \
+                || true
+              
+              echo
+              echo "Arquivos selecionados para o code review:"
+              
+              if [ -s "$MEGALINTER_FILES_TO_LINT_FILE" ]; then
+              
+                  cat "$MEGALINTER_FILES_TO_LINT_FILE"
+              
+              else
+              
+                  echo "Nenhum arquivo elegível encontrado para análise."
+              
+                  {
+                    echo "=================================================="
+                    echo "          AUTOMATED CODE REVIEW"
+                    echo "=================================================="
+                    echo
+                    echo "Nenhum arquivo elegível encontrado para análise."
+                    echo
+                    echo "Branch origem:"
+                    echo "  ${SOURCE_BRANCH:-N/A}"
+                    echo
+                    echo "Branch destino:"
+                    echo "  ${TARGET_BRANCH:-N/A}"
+                    echo
+                    echo "=================================================="
+                  } > "$REPORT_DIRECTORY/automated-code-review-summary.md"
+              
+                  exit 0
+              
+              fi
+              
+              MEGALINTER_FILES_TO_LINT="$(
+                paste -sd, "$MEGALINTER_FILES_TO_LINT_FILE"
+              )"
+              
+              echo
+              echo "Iniciando revisão automatizada..."
+              
+              docker run --rm \
+                --volume "$(Build.SourcesDirectory):/tmp/lint" \
+                --volume "$REPORT_DIRECTORY:/tmp/megalinter-reports" \
+                --user "$(id -u):$(id -g)" \
+                --env-file <(env | grep -e SYSTEM_ -e BUILD_ -e TF_ -e AGENT_ || true) \
+                --env SYSTEM_ACCESSTOKEN="$(System.AccessToken)" \
+                --env GIT_AUTHORIZATION_BEARER="$(System.AccessToken)" \
+                --env DEFAULT_WORKSPACE="/tmp/lint" \
+                --env GITHUB_WORKSPACE="/tmp/lint" \
+                --env HOME="/tmp" \
+                --env REPORT_OUTPUT_FOLDER="/tmp/megalinter-reports" \
+                --env CLEAR_REPORT_FOLDER="true" \
+                --env VALIDATE_ALL_CODEBASE="false" \
+                --env MEGALINTER_FILES_TO_LINT="$MEGALINTER_FILES_TO_LINT" \
+                --env FILTER_REGEX_EXCLUDE="(^|/)(bin|obj)/|(^|/)megalinter-reports/" \
+                --env DISABLE="$(MEGALINTER_CODE_REVIEW_DISABLED_DESCRIPTORS)" \
+                --env DISABLE_LINTERS="$(MEGALINTER_CODE_REVIEW_DISABLED_LINTERS)" \
+                --env LINTER_TIMEOUT_SECONDS="180" \
+                --env APPLY_FIXES="none" \
+                --env DISABLE_ERRORS="true" \
+                --env MARKDOWN_SUMMARY_REPORTER="true" \
+                --env MARKDOWN_SUMMARY_REPORTER_FILE_NAME="automated-code-review-summary.md" \
+                --env JSON_REPORTER="true" \
+                --env JSON_REPORTER_OUTPUT_DETAIL="detailed" \
+                --env JSON_REPORTER_FILE_NAME="automated-code-review-report.json" \
+                --env SARIF_REPORTER="true" \
+                --env SARIF_REPORTER_FILE_NAME="automated-code-review-report.sarif" \
+                --env AZURE_COMMENT_REPORTER="true" \
+                --env AZURE_COMMENT_REPORTER_LINKS_TYPE="artifacts" \
+                --env REPORTERS_MARKDOWN_TYPE="simple" \
+                --env REPORTERS_MARKDOWN_SUMMARY_TYPE="table-sections" \
+                "$(MEGALINTER_IMAGE)"
+              
+              echo
+              echo "=================================================="
+              echo "       RESULTADO AUTOMATED CODE REVIEW"
+              echo "=================================================="
+              echo "Relatórios:"
+              echo "  $REPORT_DIRECTORY"
+              echo
+              echo "Este stage está em modo não bloqueante."
+              echo "Para bloquear a pipeline por achados,"
+              echo "altere DISABLE_ERRORS para false."
+              echo "=================================================="
+
+            displayName: "Executar MegaLinter"
+
+            env:
+
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+
+          # ----------------------------------------------------
+          # RELATÓRIO CONSOLIDADO
+          # ----------------------------------------------------
+
+          - bash: |
+              set -euo pipefail
+              
+              REPORT_DIRECTORY="$(Build.ArtifactStagingDirectory)/megalinter-reports"
+              INDEX_FILE="$REPORT_DIRECTORY/README-automated-code-review.txt"
+              SOURCE_BRANCH="$(Build.SourceBranch)"
+              TARGET_BRANCH=""
+              
+              if [ -n "${SYSTEM_PULLREQUEST_SOURCEBRANCH:-}" ]; then
+              
+                  SOURCE_BRANCH="$SYSTEM_PULLREQUEST_SOURCEBRANCH"
+              
+              fi
+              
+              if [ -n "${SYSTEM_PULLREQUEST_TARGETBRANCH:-}" ]; then
+              
+                  TARGET_BRANCH="$SYSTEM_PULLREQUEST_TARGETBRANCH"
+              
+              fi
+              
+              mkdir -p "$REPORT_DIRECTORY"
+              
+              {
+                echo "=================================================="
+                echo "          AUTOMATED CODE REVIEW - RELATÓRIOS"
+                echo "=================================================="
+                echo
+                echo "Repositório:"
+                echo "  $(Build.Repository.Name)"
+                echo
+                echo "Branch:"
+                echo "  $(Build.SourceBranch)"
+                echo
+                echo "Branch origem do PR:"
+                echo "  ${SOURCE_BRANCH:-N/A}"
+                echo
+                echo "Branch destino do PR:"
+                echo "  ${TARGET_BRANCH:-N/A}"
+                echo
+                echo "Commit:"
+                echo "  $(Build.SourceVersion)"
+                echo
+                echo "Build:"
+                echo "  $(Build.BuildId)"
+                echo
+                echo "Ferramenta:"
+                echo "  MegaLinter"
+                echo
+                echo "Imagem:"
+                echo "  $(MEGALINTER_IMAGE)"
+                echo
+                echo "Descritores desabilitados neste stage:"
+                echo "  $(MEGALINTER_CODE_REVIEW_DISABLED_DESCRIPTORS)"
+                echo
+                echo "Linters pesados desabilitados neste stage:"
+                echo "  $(MEGALINTER_CODE_REVIEW_DISABLED_LINTERS)"
+                echo
+                echo "Modo:"
+                echo "  Incremental, analisando arquivos novos ou alterados"
+                echo "  Não bloqueante para teste inicial"
+                echo
+                echo "Arquivos principais:"
+                echo "  changed-files.txt"
+                echo "    Lista bruta de arquivos alterados detectados pelo Git."
+                echo
+                echo "  megalinter-files-to-lint.txt"
+                echo "    Lista filtrada enviada ao MegaLinter."
+                echo
+                echo "  automated-code-review-summary.md"
+                echo "    Resumo em Markdown para leitura rápida."
+                echo
+                echo "  automated-code-review-report.json"
+                echo "    Relatório estruturado para automações futuras."
+                echo
+                echo "  automated-code-review-report.sarif"
+                echo "    Relatório estruturado em SARIF para integração com ferramentas."
+                echo
+                echo "  logs por linter"
+                echo "    Evidências detalhadas por tecnologia/ferramenta."
+                echo
+                echo "Observação:"
+                echo "  Para transformar este stage em bloqueante,"
+                echo "  altere DISABLE_ERRORS para false no docker run."
+                echo
+                echo "=================================================="
+                echo
+                echo "Arquivos gerados:"
+                find "$REPORT_DIRECTORY" -maxdepth 2 -type f | sort
+              } > "$INDEX_FILE"
+              
+              echo "=================================================="
+              echo "       ÍNDICE DOS RELATÓRIOS GERADO"
+              echo "=================================================="
+              cat "$INDEX_FILE"
+              echo "=================================================="
+
+            displayName: "Gerar índice dos relatórios"
+
+            condition: succeededOrFailed()
+
+
+          - task: PublishPipelineArtifact@1
+
+            displayName: "Publicar relatório do code review"
+
+            condition: succeededOrFailed()
+
+            inputs:
+
+              targetPath: "$(Build.ArtifactStagingDirectory)/megalinter-reports"
+              artifact: "automated-code-review-megalinter"
+              publishLocation: "pipeline"

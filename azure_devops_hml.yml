@@ -1,0 +1,2423 @@
+# ============================================================
+# PIPELINE DE DEPLOY - HOMOLOGAÇÃO - LAMBDAQUALITY
+# ============================================================
+# Ordem: Secrets-Check > SAST-Check > SCA-Check > IaC-Check
+#        > Unit & Integration Tests > Deploy Backend > Rollback manual/opcional.
+# Pipeline manual; code review permanece em azure_devops_codereview.yml.
+# Segurança consultiva: findings podem deixar os checks vermelhos, mas não
+# impedem os testes nem a aprovação de deploy. Testes/build/lint/tipos bloqueiam.
+# CI no pool de CI configurado; publicação na VM nomeada do Azure Environment.
+# Configurar o agente nessa VM, Docker/Compose e secrets fora do repositório.
+# Guia completo: codex/CICD_HML.md. Nenhum comando de deploy é simulado.
+# ============================================================
+
+trigger: none
+pr: none
+
+parameters:
+  - name: ciPoolName
+    displayName: "Pool de agentes de CI com Docker"
+    type: string
+    default: Default
+  - name: hmlEnvironment
+    displayName: "Environment de homologação no Azure DevOps"
+    type: string
+    default: lambdaquality-hml
+  - name: hmlVmResource
+    displayName: "Nome exato da VM registrada nesse Environment"
+    type: string
+    default: lambdaquality-hml-api
+  - name: hmlDeployRoot
+    displayName: "Diretório de releases/configuração no servidor Linux"
+    type: string
+    default: /opt/lambdaquality/hml
+  - name: dockerPlatform
+    displayName: "Arquitetura do servidor Docker"
+    type: string
+    default: linux/amd64
+    values:
+      - linux/amd64
+      - linux/arm64
+
+pool:
+  name: ${{ parameters.ciPoolName }}
+
+variables:
+
+  SEMGREP_IMAGE: "semgrep/semgrep:latest"
+  GITLEAKS_IMAGE: "ghcr.io/gitleaks/gitleaks:latest"
+  TRIVY_IMAGE: "aquasec/trivy:latest"
+
+  # ----------------------------------------------------------
+  # GITLEAKS
+  # ----------------------------------------------------------
+  #
+  # branch:
+  #   Analisa todos os commits exclusivos da branch atual.
+  #
+  # current:
+  #   Analisa somente o estado atual completo do repositório.
+  #
+  # history:
+  #   Analisa todo o histórico Git.
+  #
+
+  # Deploy analisa o estado completo, inclusive quando executado na branch base.
+  GITLEAKS_MODE: "current"
+
+  # Branch base padrão.
+  #
+  # Regras automáticas:
+  #
+  # feature/* -> develop
+  # bugfix/*  -> develop
+  # hotfix/*  -> master
+  #
+
+  GITLEAKS_BASE_BRANCH: "develop"
+
+  # Severidades bloqueantes do Trivy.
+
+  TRIVY_SEVERITIES: "HIGH,CRITICAL"
+
+  # Diretórios de trabalho.
+
+  SECURITY_REPORTS_DIRECTORY: "$(Build.ArtifactStagingDirectory)/security-reports"
+  TRIVY_CACHE_DIRECTORY: "$(Pipeline.Workspace)/trivy-cache"
+
+  NODE_VERSION: "24.15.0"
+  TEST_RESULTS_DIRECTORY: "$(Build.ArtifactStagingDirectory)/test-results"
+  RELEASE_DIRECTORY: "$(Build.ArtifactStagingDirectory)/backend-release"
+  RELEASE_ID: "$(Build.BuildId)-$(Build.SourceVersion)"
+  API_IMAGE: "lambdaquality-api:$(RELEASE_ID)"
+  MIGRATIONS_IMAGE: "lambdaquality-migrations:$(RELEASE_ID)"
+
+stages:
+
+  # ============================================================
+  # 1. SECRETS CHECK
+  # ============================================================
+
+  - stage: Secrets_Check
+
+    displayName: "1. Secrets-Check"
+
+    dependsOn: []
+
+    condition: succeededOrFailed()
+
+    jobs:
+
+      - job: Gitleaks
+        condition: not(canceled())
+
+        displayName: "Gitleaks - Detecção de credenciais"
+
+        timeoutInMinutes: 60
+
+        steps:
+
+          # ----------------------------------------------------
+          # Precisamos do histórico Git para calcular merge-base
+          # e commits exclusivos da branch.
+          #
+          # Isso não significa que o scanner executará todo o
+          # histórico quando GITLEAKS_MODE=branch.
+          # ----------------------------------------------------
+
+          - checkout: self
+
+            displayName: "Checkout do repositório"
+
+            clean: true
+            fetchDepth: 0
+            persistCredentials: true
+
+
+          # ----------------------------------------------------
+          # EXECUÇÃO
+          # ----------------------------------------------------
+
+          - bash: |
+              set -euo pipefail
+              
+              REPORT_DIRECTORY="$(SECURITY_REPORTS_DIRECTORY)/secrets"
+              REPORT_FILE="$REPORT_DIRECTORY/gitleaks-report.json"
+              EXIT_CODE_FILE="$REPORT_DIRECTORY/gitleaks-exit-code.txt"
+              SCOPE_FILE="$REPORT_DIRECTORY/gitleaks-scope.txt"
+              
+              mkdir -p "$REPORT_DIRECTORY"
+              
+              GITLEAKS_MODE="$(GITLEAKS_MODE)"
+              CONFIGURED_BASE_BRANCH="$(GITLEAKS_BASE_BRANCH)"
+              SOURCE_BRANCH="$(Build.SourceBranch)"
+              
+              echo "=================================================="
+              echo "            SECRETS CHECK - GITLEAKS"
+              echo "=================================================="
+              echo "Repositório: $(Build.Repository.Name)"
+              echo "Branch: $SOURCE_BRANCH"
+              echo "Commit: $(Build.SourceVersion)"
+              echo "Imagem: $(GITLEAKS_IMAGE)"
+              echo "Modo configurado: $GITLEAKS_MODE"
+              echo "=================================================="
+              
+              # ==================================================
+              # DETERMINAÇÃO DA BRANCH BASE
+              # ==================================================
+              
+              BASE_BRANCH="$CONFIGURED_BASE_BRANCH"
+              
+              if [[ "$SOURCE_BRANCH" == refs/heads/feature/* ]]; then
+              
+                  BASE_BRANCH="develop"
+              
+              elif [[ "$SOURCE_BRANCH" == refs/heads/bugfix/* ]]; then
+              
+                  BASE_BRANCH="develop"
+              
+              elif [[ "$SOURCE_BRANCH" == refs/heads/hotfix/* ]]; then
+              
+                  BASE_BRANCH="master"
+              
+              fi
+              
+              echo
+              echo "Branch base determinada: $BASE_BRANCH"
+              
+              # ==================================================
+              # INFORMAÇÕES DO REPOSITÓRIO
+              # ==================================================
+              
+              echo
+              echo "Commit atual:"
+              git log -1 --oneline || true
+              
+              echo
+              echo "Quantidade total de commits disponíveis localmente:"
+              git rev-list --count HEAD || true
+              
+              # ==================================================
+              # IMAGEM
+              # ==================================================
+              
+              echo
+              echo "Obtendo imagem do Gitleaks..."
+              
+              docker pull "$(GITLEAKS_IMAGE)"
+              
+              echo
+              echo "Versão do Gitleaks:"
+              
+              docker run --rm \
+                "$(GITLEAKS_IMAGE)" \
+                version
+              
+              GITLEAKS_EXIT_CODE=0
+              
+              # ==================================================
+              # MODE: BRANCH
+              # ==================================================
+              
+              if [ "$GITLEAKS_MODE" = "branch" ]; then
+              
+                  echo
+                  echo "=================================================="
+                  echo "       MODO: COMMITS EXCLUSIVOS DA BRANCH"
+                  echo "=================================================="
+              
+                  echo
+                  echo "Atualizando referência da branch base..."
+              
+                  git fetch origin \
+                    "+refs/heads/$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH"
+              
+                  BASE_REF="origin/$BASE_BRANCH"
+              
+                  echo
+                  echo "Branch atual:"
+                  echo "  $SOURCE_BRANCH"
+              
+                  echo
+                  echo "Branch base:"
+                  echo "  $BASE_REF"
+              
+                  MERGE_BASE=$(git merge-base HEAD "$BASE_REF")
+              
+                  echo
+                  echo "Merge base:"
+                  echo "  $MERGE_BASE"
+              
+                  echo
+                  echo "Commit atual da branch base:"
+              
+                  git log \
+                    -1 \
+                    --oneline \
+                    "$BASE_REF" \
+                    || true
+              
+                  BRANCH_COMMIT_COUNT=$(
+                    git rev-list \
+                      --count \
+                      "$MERGE_BASE..HEAD"
+                  )
+              
+                  echo
+                  echo "Commits exclusivos da branch atual:"
+                  echo
+                  echo "Quantidade: $BRANCH_COMMIT_COUNT"
+                  echo
+              
+                  if [ "$BRANCH_COMMIT_COUNT" -gt 0 ]; then
+              
+                      git log \
+                        --oneline \
+                        --decorate \
+                        "$MERGE_BASE..HEAD"
+              
+                  else
+              
+                      echo "Nenhum commit exclusivo encontrado."
+              
+                  fi
+              
+                  echo
+                  echo "Escopo Gitleaks:"
+                  echo "  $MERGE_BASE..HEAD"
+              
+                  {
+                    echo "Modo: branch"
+                    echo "Branch atual: $SOURCE_BRANCH"
+                    echo "Branch base: $BASE_REF"
+                    echo "Merge base: $MERGE_BASE"
+                    echo "Commits analisados: $BRANCH_COMMIT_COUNT"
+                    echo "Range: $MERGE_BASE..HEAD"
+                  } > "$SCOPE_FILE"
+              
+                  if [ "$BRANCH_COMMIT_COUNT" -eq 0 ]; then
+              
+                      echo
+                      echo "Nenhum commit exclusivo da branch."
+              
+                      echo "[]" > "$REPORT_FILE"
+              
+                      GITLEAKS_EXIT_CODE=0
+              
+                  else
+              
+                      echo
+                      echo "Iniciando análise dos commits exclusivos da branch..."
+              
+                      set +e
+              
+                      docker run --rm \
+                        --volume "$(Build.SourcesDirectory):/repo:ro" \
+                        --volume "$REPORT_DIRECTORY:/reports" \
+                        --workdir /repo \
+                        "$(GITLEAKS_IMAGE)" \
+                        git \
+                          --redact \
+                          --no-color \
+                          --log-opts="$MERGE_BASE..HEAD" \
+                          --report-format json \
+                          --report-path /reports/gitleaks-report.json \
+                          .
+              
+                      GITLEAKS_EXIT_CODE=$?
+              
+                      set -e
+              
+                  fi
+              
+              
+              # ==================================================
+              # MODE: CURRENT
+              # ==================================================
+              
+              elif [ "$GITLEAKS_MODE" = "current" ]; then
+              
+                  echo
+                  echo "=================================================="
+                  echo "          MODO: ESTADO ATUAL DO CÓDIGO"
+                  echo "=================================================="
+              
+                  {
+                    echo "Modo: current"
+                    echo "Branch atual: $SOURCE_BRANCH"
+                    echo "Commit: $(Build.SourceVersion)"
+                    echo "Escopo: estado atual do repositório"
+                  } > "$SCOPE_FILE"
+              
+                  echo
+                  echo "Todo o conteúdo atual do repositório será analisado."
+                  echo "O histórico Git não será analisado."
+              
+                  set +e
+              
+                  docker run --rm \
+                    --volume "$(Build.SourcesDirectory):/repo:ro" \
+                    --volume "$REPORT_DIRECTORY:/reports" \
+                    --workdir /repo \
+                    "$(GITLEAKS_IMAGE)" \
+                    dir \
+                      --redact \
+                      --no-color \
+                      --report-format json \
+                      --report-path /reports/gitleaks-report.json \
+                      .
+              
+                  GITLEAKS_EXIT_CODE=$?
+              
+                  set -e
+              
+              
+              # ==================================================
+              # MODE: HISTORY
+              # ==================================================
+              
+              elif [ "$GITLEAKS_MODE" = "history" ]; then
+              
+                  echo
+                  echo "=================================================="
+                  echo "          MODO: HISTÓRICO GIT COMPLETO"
+                  echo "=================================================="
+              
+                  {
+                    echo "Modo: history"
+                    echo "Branch atual: $SOURCE_BRANCH"
+                    echo "Escopo: histórico completo alcançável pelo HEAD"
+                  } > "$SCOPE_FILE"
+              
+                  echo
+                  echo "Todo o histórico Git será analisado."
+                  echo "Esta operação pode demorar em repositórios legados."
+              
+                  set +e
+              
+                  docker run --rm \
+                    --volume "$(Build.SourcesDirectory):/repo:ro" \
+                    --volume "$REPORT_DIRECTORY:/reports" \
+                    --workdir /repo \
+                    "$(GITLEAKS_IMAGE)" \
+                    git \
+                      --redact \
+                      --no-color \
+                      --report-format json \
+                      --report-path /reports/gitleaks-report.json \
+                      .
+              
+                  GITLEAKS_EXIT_CODE=$?
+              
+                  set -e
+              
+              
+              # ==================================================
+              # MODO INVÁLIDO
+              # ==================================================
+              
+              else
+              
+                  echo
+                  echo "##vso[task.logissue type=error]Modo Gitleaks inválido: $GITLEAKS_MODE"
+              
+                  echo
+                  echo "Valores permitidos:"
+                  echo "  branch"
+                  echo "  current"
+                  echo "  history"
+              
+                  exit 2
+              
+              fi
+              
+              # ==================================================
+              # RESULTADO
+              # ==================================================
+              
+              echo "$GITLEAKS_EXIT_CODE" > "$EXIT_CODE_FILE"
+              
+              if [ ! -f "$REPORT_FILE" ]; then
+              
+                  echo "[]" > "$REPORT_FILE"
+              
+              fi
+              
+              echo
+              echo "=================================================="
+              echo "              RESULTADO GITLEAKS"
+              echo "=================================================="
+              echo "Código de saída: $GITLEAKS_EXIT_CODE"
+              echo "=================================================="
+              
+              if [ "$GITLEAKS_EXIT_CODE" -eq 0 ]; then
+              
+                  echo "Nenhum secret encontrado no escopo analisado."
+              
+                  exit 0
+              
+              elif [ "$GITLEAKS_EXIT_CODE" -eq 1 ]; then
+              
+                  echo "##vso[task.logissue type=error]Secrets encontrados no escopo analisado."
+              
+                  exit 1
+              
+              else
+              
+                  echo "##vso[task.logissue type=error]Erro operacional do Gitleaks. Código: $GITLEAKS_EXIT_CODE"
+              
+                  exit "$GITLEAKS_EXIT_CODE"
+              
+              fi
+
+            displayName: "Executar Gitleaks"
+
+
+          # ----------------------------------------------------
+          # RESUMO
+          # ----------------------------------------------------
+
+          - bash: |
+              set -euo pipefail
+              
+              REPORT_DIRECTORY="$(SECURITY_REPORTS_DIRECTORY)/secrets"
+              REPORT_FILE="$REPORT_DIRECTORY/gitleaks-report.json"
+              EXIT_CODE_FILE="$REPORT_DIRECTORY/gitleaks-exit-code.txt"
+              SCOPE_FILE="$REPORT_DIRECTORY/gitleaks-scope.txt"
+              
+              echo "=================================================="
+              echo "          RESUMO DE SEGURANÇA - SECRETS"
+              echo "=================================================="
+              
+              if [ -f "$SCOPE_FILE" ]; then
+              
+                  echo
+                  echo "Escopo da análise:"
+              
+                  cat "$SCOPE_FILE"
+              
+              fi
+              
+              if [ ! -f "$REPORT_FILE" ]; then
+              
+                  echo
+                  echo "Relatório não encontrado."
+              
+                  exit 0
+              
+              fi
+              
+              python3 - "$REPORT_FILE" "$EXIT_CODE_FILE" <<'PYTHON'
+              import json
+              import sys
+              
+              from collections import Counter
+              from pathlib import Path
+              
+              
+              report_file = Path(sys.argv[1])
+              exit_code_file = Path(sys.argv[2])
+              
+              
+              try:
+              
+                  findings = json.loads(
+                      report_file.read_text(
+                          encoding="utf-8"
+                      )
+                  )
+              
+              except Exception as exc:
+              
+                  print()
+                  print(
+                      f"Erro ao interpretar relatório: {exc}"
+                  )
+              
+                  raise SystemExit(0)
+              
+              
+              if not isinstance(findings, list):
+              
+                  findings = []
+              
+              
+              exit_code = (
+                  exit_code_file.read_text(
+                      encoding="utf-8"
+                  ).strip()
+                  if exit_code_file.exists()
+                  else "N/A"
+              )
+              
+              
+              files = Counter()
+              rules = Counter()
+              commits = Counter()
+              
+              
+              for finding in findings:
+              
+                  file_name = (
+                      finding.get("File")
+                      or finding.get("file")
+                      or "N/A"
+                  )
+              
+                  rule_id = (
+                      finding.get("RuleID")
+                      or finding.get("rule_id")
+                      or "N/A"
+                  )
+              
+                  commit = (
+                      finding.get("Commit")
+                      or finding.get("commit")
+                      or "N/A"
+                  )
+              
+                  files[file_name] += 1
+                  rules[rule_id] += 1
+              
+                  if commit != "N/A":
+              
+                      commits[commit] += 1
+              
+              
+              print()
+              print(
+                  f"Código de saída:                 "
+                  f"{exit_code}"
+              )
+              
+              print(
+                  f"Secrets encontrados:             "
+                  f"{len(findings)}"
+              )
+              
+              print(
+                  f"Arquivos afetados:               "
+                  f"{len(files)}"
+              )
+              
+              print(
+                  f"Commits afetados:                "
+                  f"{len(commits)}"
+              )
+              
+              print(
+                  f"Tipos de regra acionados:        "
+                  f"{len(rules)}"
+              )
+              
+              
+              if rules:
+              
+                  print()
+                  print("Por tipo de secret:")
+              
+                  for rule_id, count in rules.most_common():
+              
+                      print(
+                          f"  {rule_id:<45} "
+                          f"{count:>5}"
+                      )
+              
+              
+              if files:
+              
+                  print()
+                  print("Arquivos mais afetados:")
+              
+                  for file_name, count in files.most_common(15):
+              
+                      print(
+                          f"  {file_name:<70} "
+                          f"{count:>5}"
+                      )
+              
+              
+              if findings:
+              
+                  print()
+                  print("Principais ocorrências:")
+              
+                  for finding in findings[:20]:
+              
+                      file_name = (
+                          finding.get("File")
+                          or finding.get("file")
+                          or "N/A"
+                      )
+              
+                      line = (
+                          finding.get("StartLine")
+                          or finding.get("start_line")
+                          or "N/A"
+                      )
+              
+                      rule = (
+                          finding.get("RuleID")
+                          or finding.get("rule_id")
+                          or "N/A"
+                      )
+              
+                      commit = (
+                          finding.get("Commit")
+                          or finding.get("commit")
+                          or "N/A"
+                      )
+              
+                      author = (
+                          finding.get("Author")
+                          or finding.get("author")
+                          or "N/A"
+                      )
+              
+                      print()
+                      print(f"[ALTO] {rule}")
+                      print(
+                          f"  Arquivo: "
+                          f"{file_name}:{line}"
+                      )
+                      print(
+                          f"  Commit: {commit}"
+                      )
+                      print(
+                          f"  Autor: {author}"
+                      )
+              
+              
+                  if len(findings) > 20:
+              
+                      remaining = (
+                          len(findings) - 20
+                      )
+              
+                      print()
+                      print(
+                          f"... mais {remaining} ocorrência(s) "
+                          "no relatório JSON."
+                      )
+              
+              
+                  print()
+                  print("Ação recomendada:")
+                  print(
+                      "  - Revogar/rotacionar credenciais reais"
+                  )
+                  print(
+                      "  - Remover credenciais do código"
+                  )
+                  print(
+                      "  - Avaliar necessidade de limpeza do histórico"
+                  )
+              
+              else:
+              
+                  print()
+                  print(
+                      "Resultado: nenhum secret encontrado "
+                      "no escopo analisado."
+                  )
+              
+              
+              print()
+              print(
+                  "=================================================="
+              )
+              PYTHON
+
+            displayName: "Exibir resumo de secrets"
+
+            condition: always()
+
+
+          # ----------------------------------------------------
+          # PUBLICAÇÃO
+          # ----------------------------------------------------
+
+          - task: PublishPipelineArtifact@1
+
+            displayName: "Publicar relatório de secrets"
+
+            condition: always()
+
+            inputs:
+              targetPath: "$(SECURITY_REPORTS_DIRECTORY)/secrets"
+              artifact: "security-secrets-gitleaks"
+              publishLocation: "pipeline"
+
+  # ============================================================
+  # 2. SAST CHECK
+  # ============================================================
+
+  - stage: SAST_Check
+
+    displayName: "2. SAST-Check"
+
+    dependsOn: Secrets_Check
+
+    condition: succeededOrFailed()
+
+    jobs:
+
+      - job: Semgrep
+        condition: not(canceled())
+
+        displayName: "Semgrep - Análise estática"
+
+        timeoutInMinutes: 40
+
+        steps:
+
+          - checkout: self
+
+            displayName: "Checkout do repositório"
+
+            clean: true
+            fetchDepth: 1
+
+
+          - bash: |
+              set -euo pipefail
+              
+              REPORT_DIRECTORY="$(SECURITY_REPORTS_DIRECTORY)/sast"
+              REPORT_FILE="$REPORT_DIRECTORY/semgrep-report.json"
+              EXIT_CODE_FILE="$REPORT_DIRECTORY/semgrep-exit-code.txt"
+              
+              mkdir -p "$REPORT_DIRECTORY"
+              
+              echo "=================================================="
+              echo "              SAST CHECK - SEMGREP"
+              echo "=================================================="
+              echo "Repositório: $(Build.Repository.Name)"
+              echo "Branch: $(Build.SourceBranch)"
+              echo "Commit: $(Build.SourceVersion)"
+              echo "Imagem: $(SEMGREP_IMAGE)"
+              echo
+              echo "Diretórios/arquivos ignorados:"
+              echo "  src/generated"
+              echo "  dist"
+              echo "  .local"
+              echo "  test-results"
+              echo "  node_modules"
+              echo "  TestResults"
+              echo "  publish"
+              echo "  artifacts"
+              echo "  bibliotecas JS de terceiros"
+              echo "=================================================="
+              
+              docker pull "$(SEMGREP_IMAGE)"
+              
+              echo
+              echo "Versão:"
+              
+              docker run --rm \
+                "$(SEMGREP_IMAGE)" \
+                semgrep \
+                --version
+              
+              echo
+              echo "Iniciando SAST..."
+              
+              set +e
+              
+              docker run --rm \
+                --volume "$(Build.SourcesDirectory):/src:ro" \
+                --volume "$REPORT_DIRECTORY:/reports" \
+                --workdir /src \
+                "$(SEMGREP_IMAGE)" \
+                semgrep scan \
+                  --config p/typescript \
+                  --config p/nodejs \
+                  --config p/security-audit \
+                  --config p/owasp-top-ten \
+                  --metrics off \
+                  --error \
+                  --json \
+                  --output /reports/semgrep-report.json \
+                  \
+                  --exclude "**/src/generated/**" \
+                  --exclude "**/dist/**" \
+                  --exclude "**/.local/**" \
+                  --exclude "**/test-results/**" \
+                  --exclude "**/node_modules/**" \
+                  --exclude "**/TestResults/**" \
+                  --exclude "**/publish/**" \
+                  --exclude "**/artifacts/**" \
+                  \
+                  --exclude "**/jquery*.js" \
+                  --exclude "**/jquery-ui*.js" \
+                  --exclude "**/jquery.*.js" \
+                  --exclude "**/highcharts*.js" \
+                  --exclude "**/charts.min*.js" \
+                  --exclude "**/moment*.js" \
+                  --exclude "**/modernizr*.js" \
+                  --exclude "**/bootstrap*.js" \
+                  --exclude "**/tinymce/**" \
+                  --exclude "**/guacamole-common-js/**" \
+                  --exclude "**/*.intellisense.js" \
+                  --exclude "**/*-vsdoc.js" \
+                  --exclude "**/_references.js" \
+                  .
+              
+              SEMGREP_EXIT_CODE=$?
+              
+              set -e
+              
+              echo "$SEMGREP_EXIT_CODE" > "$EXIT_CODE_FILE"
+              
+              if [ ! -f "$REPORT_FILE" ]; then
+              
+                echo "##vso[task.logissue type=error]Relatório Semgrep não foi gerado."
+              
+                exit 2
+              
+              fi
+              
+              exit "$SEMGREP_EXIT_CODE"
+
+            displayName: "Executar Semgrep"
+
+
+          - bash: |
+              set -euo pipefail
+              
+              REPORT_DIRECTORY="$(SECURITY_REPORTS_DIRECTORY)/sast"
+              REPORT_FILE="$REPORT_DIRECTORY/semgrep-report.json"
+              
+              echo "=================================================="
+              echo "          RESUMO DE SEGURANÇA - SAST"
+              echo "=================================================="
+              
+              if [ ! -f "$REPORT_FILE" ]; then
+              
+                echo "Relatório Semgrep não encontrado."
+              
+                exit 0
+              
+              fi
+              
+              python3 - "$REPORT_FILE" <<'PYTHON'
+              import json
+              import sys
+              
+              from collections import Counter
+              from pathlib import Path
+              
+              
+              report_path = Path(sys.argv[1])
+              
+              
+              try:
+              
+                  report = json.loads(
+                      report_path.read_text(
+                          encoding="utf-8"
+                      )
+                  )
+              
+              except Exception as exc:
+              
+                  print(
+                      f"Erro ao interpretar JSON: {exc}"
+                  )
+              
+                  raise SystemExit(0)
+              
+              
+              results = (
+                  report.get("results", [])
+                  or []
+              )
+              
+              errors = (
+                  report.get("errors", [])
+                  or []
+              )
+              
+              
+              parse_errors = []
+              timeouts = []
+              other_errors = []
+              
+              
+              for error in errors:
+              
+                  error_type = error.get("type")
+                  message = error.get(
+                      "message",
+                      ""
+                  )
+              
+                  text_type = str(
+                      error_type
+                  ).lower()
+              
+                  text_message = (
+                      message.lower()
+                  )
+              
+                  if (
+                      "timeout" in text_type
+                      or "timeout" in text_message
+                  ):
+              
+                      timeouts.append(error)
+              
+                  elif (
+                      "syntax" in text_type
+                      or "partialparsing" in text_type
+                      or "syntax error" in text_message
+                  ):
+              
+                      parse_errors.append(error)
+              
+                  else:
+              
+                      other_errors.append(error)
+              
+              
+              vuln_groups = Counter()
+              severity_groups = Counter()
+              confidence_groups = Counter()
+              impact_groups = Counter()
+              files = Counter()
+              
+              priority_findings = []
+              
+              
+              def classify_finding(finding):
+              
+                  extra = (
+                      finding.get("extra", {})
+                  )
+              
+                  metadata = (
+                      extra.get("metadata", {})
+                      or {}
+                  )
+              
+                  vuln_classes = (
+                      metadata.get(
+                          "vulnerability_class"
+                      )
+                      or []
+                  )
+              
+                  if isinstance(
+                      vuln_classes,
+                      str
+                  ):
+              
+                      vuln_classes = [
+                          vuln_classes
+                      ]
+              
+                  check_id = (
+                      finding.get(
+                          "check_id",
+                          ""
+                      ).lower()
+                  )
+              
+                  message = (
+                      extra.get(
+                          "message",
+                          ""
+                      ).lower()
+                  )
+              
+                  text = (
+                      " ".join(
+                          vuln_classes
+                      ).lower()
+                      + " "
+                      + check_id
+                      + " "
+                      + message
+                  )
+              
+                  if (
+                      "sql injection" in text
+                      or "sqli" in text
+                  ):
+              
+                      return "SQL Injection"
+              
+                  if (
+                      "missing authorization" in text
+                      or "improper authorization" in text
+                  ):
+              
+                      return "Missing Authorization"
+              
+                  if (
+                      "hard-coded" in text
+                      or "credential" in text
+                      or "username and password" in text
+                  ):
+              
+                      return "Hard-coded Credentials"
+              
+                  if (
+                      "certificate" in text
+                      or "trust manager" in text
+                      or "hostnameverifier" in text
+                      or "improper authentication" in text
+                  ):
+              
+                      return "Improper Certificate Validation"
+              
+                  if (
+                      "plaintext http" in text
+                      or "cleartext transmission" in text
+                  ):
+              
+                      return "Plaintext HTTP"
+              
+                  if (
+                      "weak ssl" in text
+                      or "weak tls" in text
+                      or "cryptographic issues" in text
+                  ):
+              
+                      return "Weak TLS"
+              
+                  if (
+                      "md5" in text
+                      or "weak hash" in text
+                      or "insecure hashing" in text
+                  ):
+              
+                      return "Weak Hash / MD5"
+              
+                  if vuln_classes:
+              
+                      return vuln_classes[0]
+              
+                  return "Other"
+              
+              
+              for finding in results:
+              
+                  extra = (
+                      finding.get(
+                          "extra",
+                          {}
+                      )
+                  )
+              
+                  metadata = (
+                      extra.get(
+                          "metadata",
+                          {}
+                      )
+                      or {}
+                  )
+              
+                  category = (
+                      classify_finding(
+                          finding
+                      )
+                  )
+              
+                  vuln_groups[
+                      category
+                  ] += 1
+              
+                  severity_groups[
+                      extra.get(
+                          "severity",
+                          "UNKNOWN"
+                      )
+                  ] += 1
+              
+                  confidence_groups[
+                      metadata.get(
+                          "confidence",
+                          "UNKNOWN"
+                      )
+                  ] += 1
+              
+                  impact_groups[
+                      metadata.get(
+                          "impact",
+                          "UNKNOWN"
+                      )
+                  ] += 1
+              
+                  path = finding.get(
+                      "path",
+                      "N/A"
+                  )
+              
+                  files[path] += 1
+              
+                  impact = str(
+                      metadata.get(
+                          "impact",
+                          ""
+                      )
+                  ).upper()
+              
+                  if (
+                      category in {
+                          "Hard-coded Credentials",
+                          "Improper Certificate Validation",
+                          "SQL Injection",
+                      }
+                      or impact == "HIGH"
+                  ):
+              
+                      priority_findings.append(
+                          finding
+                      )
+              
+              
+              print()
+              print(
+                  f"Findings confirmados:             "
+                  f"{len(results)}"
+              )
+              
+              print(
+                  f"Análises inconclusivas/timeouts:  "
+                  f"{len(timeouts)}"
+              )
+              
+              print(
+                  f"Erros de parsing:                 "
+                  f"{len(parse_errors)}"
+              )
+              
+              print(
+                  f"Outros erros do scanner:          "
+                  f"{len(other_errors)}"
+              )
+              
+              
+              print()
+              print("Por vulnerabilidade:")
+              print()
+              
+              
+              preferred_order = [
+                  "SQL Injection",
+                  "Missing Authorization",
+                  "Improper Certificate Validation",
+                  "Plaintext HTTP",
+                  "Hard-coded Credentials",
+                  "Weak TLS",
+                  "Weak Hash / MD5",
+                  "Other",
+              ]
+              
+              
+              printed = set()
+              
+              
+              for name in preferred_order:
+              
+                  count = vuln_groups.get(
+                      name,
+                      0
+                  )
+              
+                  if count:
+              
+                      print(
+                          f"{name:<38} "
+                          f"{count:>5}"
+                      )
+              
+                      printed.add(name)
+              
+              
+              for name, count in (
+                  vuln_groups.most_common()
+              ):
+              
+                  if name not in printed:
+              
+                      print(
+                          f"{name:<38} "
+                          f"{count:>5}"
+                      )
+              
+              
+              print()
+              print("Por severidade do Semgrep:")
+              
+              for severity, count in (
+                  severity_groups.most_common()
+              ):
+              
+                  print(
+                      f"  {severity:<15} "
+                      f"{count:>5}"
+                  )
+              
+              
+              print()
+              print("Por impacto:")
+              
+              for impact, count in (
+                  impact_groups.most_common()
+              ):
+              
+                  print(
+                      f"  {impact:<15} "
+                      f"{count:>5}"
+                  )
+              
+              
+              print()
+              print("Por confiança:")
+              
+              for confidence, count in (
+                  confidence_groups.most_common()
+              ):
+              
+                  print(
+                      f"  {confidence:<15} "
+                      f"{count:>5}"
+                  )
+              
+              
+              print()
+              print(
+                  "Principais pontos prioritários:"
+              )
+              print()
+              
+              
+              for finding in (
+                  priority_findings[:20]
+              ):
+              
+                  extra = finding.get(
+                      "extra",
+                      {}
+                  )
+              
+                  metadata = (
+                      extra.get(
+                          "metadata",
+                          {}
+                      )
+                      or {}
+                  )
+              
+                  path = finding.get(
+                      "path",
+                      "N/A"
+                  )
+              
+                  line = (
+                      finding.get(
+                          "start",
+                          {}
+                      ).get(
+                          "line",
+                          "N/A"
+                      )
+                  )
+              
+                  category = (
+                      classify_finding(
+                          finding
+                      )
+                  )
+              
+                  impact = metadata.get(
+                      "impact",
+                      "UNKNOWN"
+                  )
+              
+                  confidence = metadata.get(
+                      "confidence",
+                      "UNKNOWN"
+                  )
+              
+                  print(
+                      f"[ALTO] {category}"
+                  )
+              
+                  print(
+                      f"  {path}:{line}"
+                  )
+              
+                  print(
+                      f"  Impacto: {impact}"
+                  )
+              
+                  print(
+                      f"  Confiança: {confidence}"
+                  )
+              
+                  print()
+              
+              
+              if len(
+                  priority_findings
+              ) > 20:
+              
+                  print(
+                      f"... mais "
+                      f"{len(priority_findings) - 20} "
+                      "findings prioritários no JSON."
+                  )
+              
+                  print()
+              
+              
+              print(
+                  "Arquivos mais afetados:"
+              )
+              
+              for path, count in (
+                  files.most_common(15)
+              ):
+              
+                  print(
+                      f"  {path:<75} "
+                      f"{count:>5}"
+                  )
+              
+              
+              if timeouts:
+              
+                  print()
+                  print("Cobertura:")
+              
+                  print(
+                      "  ATENÇÃO: algumas análises "
+                      "não puderam ser concluídas."
+                  )
+              
+                  print()
+              
+                  timeout_rules = Counter()
+              
+                  for error in timeouts:
+              
+                      rule_id = (
+                          error.get(
+                              "rule_id"
+                          )
+                      )
+              
+                      message = (
+                          error.get(
+                              "message",
+                              ""
+                          )
+                      )
+              
+                      if rule_id:
+              
+                          timeout_rules[
+                              rule_id
+                          ] += 1
+              
+                      if (
+                          "xpath"
+                          in message.lower()
+                      ):
+              
+                          timeout_rules[
+                              "XPath analysis"
+                          ] += 1
+              
+                      if (
+                          "ldap"
+                          in message.lower()
+                      ):
+              
+                          timeout_rules[
+                              "LDAP analysis"
+                          ] += 1
+              
+              
+                  for rule, count in (
+                      timeout_rules.most_common()
+                  ):
+              
+                      print(
+                          f"  - {rule}: "
+                          f"{count}"
+                      )
+              
+              
+              if parse_errors:
+              
+                  print()
+                  print("Erros de parsing:")
+              
+                  for error in (
+                      parse_errors[:10]
+                  ):
+              
+                      path = error.get(
+                          "path",
+                          "N/A"
+                      )
+              
+                      print(
+                          f"  - {path}"
+                      )
+              
+                  if len(
+                      parse_errors
+                  ) > 10:
+              
+                      print(
+                          f"  ... mais "
+                          f"{len(parse_errors) - 10}"
+                      )
+              
+              
+              print()
+              print(
+                  "=================================================="
+              )
+              PYTHON
+
+            displayName: "Exibir resumo consolidado SAST"
+
+            condition: always()
+
+
+          - task: PublishPipelineArtifact@1
+
+            displayName: "Publicar relatório SAST"
+
+            condition: always()
+
+            inputs:
+              targetPath: "$(SECURITY_REPORTS_DIRECTORY)/sast"
+              artifact: "security-sast-semgrep"
+              publishLocation: "pipeline"
+
+  # ============================================================
+  # 3. SCA CHECK
+  # ============================================================
+
+  - stage: SCA_Check
+
+    displayName: "3. SCA-Check"
+
+    dependsOn: SAST_Check
+
+    condition: succeededOrFailed()
+
+    jobs:
+
+      - job: TrivySCA
+        condition: not(canceled())
+
+        displayName: "Trivy - Dependências vulneráveis"
+
+        timeoutInMinutes: 30
+
+        steps:
+
+          - checkout: self
+
+            displayName: "Checkout do repositório"
+
+            clean: true
+            fetchDepth: 1
+
+
+          - bash: |
+              set -euo pipefail
+              
+              REPORT_DIRECTORY="$(SECURITY_REPORTS_DIRECTORY)/sca"
+              REPORT_FILE="$REPORT_DIRECTORY/trivy-sca-report.json"
+              EXIT_CODE_FILE="$REPORT_DIRECTORY/trivy-exit-code.txt"
+              
+              mkdir -p "$REPORT_DIRECTORY"
+              mkdir -p "$(TRIVY_CACHE_DIRECTORY)"
+              
+              echo "=================================================="
+              echo "                SCA CHECK - TRIVY"
+              echo "=================================================="
+              echo "Repositório: $(Build.Repository.Name)"
+              echo "Branch: $(Build.SourceBranch)"
+              echo "Commit: $(Build.SourceVersion)"
+              echo "Imagem: $(TRIVY_IMAGE)"
+              echo "Severidades bloqueantes: $(TRIVY_SEVERITIES)"
+              echo "Ignorar sem correção disponível: sim"
+              echo "=================================================="
+              
+              docker pull "$(TRIVY_IMAGE)"
+              
+              echo
+              echo "Versão:"
+              
+              docker run --rm \
+                "$(TRIVY_IMAGE)" \
+                --version
+              
+              echo
+              echo "Iniciando análise de dependências..."
+              
+              set +e
+              
+              docker run --rm \
+                --volume "$(Build.SourcesDirectory):/project:ro" \
+                --volume "$REPORT_DIRECTORY:/reports" \
+                --volume "$(TRIVY_CACHE_DIRECTORY):/root/.cache/trivy" \
+                "$(TRIVY_IMAGE)" \
+                filesystem \
+                  --scanners vuln \
+                  --severity "$(TRIVY_SEVERITIES)" \
+                  --ignore-unfixed \
+                  --exit-code 1 \
+                  --format json \
+                  --output /reports/trivy-sca-report.json \
+                  /project
+              
+              EXIT_CODE=$?
+              
+              set -e
+              
+              echo "$EXIT_CODE" > "$EXIT_CODE_FILE"
+              
+              if [ ! -f "$REPORT_FILE" ]; then
+              
+                echo "##vso[task.logissue type=error]Relatório Trivy não foi gerado."
+              
+                exit 2
+              
+              fi
+              
+              exit "$EXIT_CODE"
+
+            displayName: "Executar Trivy SCA"
+
+
+          - bash: |
+              set -euo pipefail
+              
+              REPORT_FILE="$(SECURITY_REPORTS_DIRECTORY)/sca/trivy-sca-report.json"
+              
+              echo "=================================================="
+              echo "           RESUMO DE SEGURANÇA - SCA"
+              echo "=================================================="
+              
+              if [ ! -f "$REPORT_FILE" ]; then
+              
+                echo "Relatório não encontrado."
+              
+                exit 0
+              
+              fi
+              
+              python3 - "$REPORT_FILE" <<'PYTHON'
+              import json
+              import sys
+              
+              from collections import Counter
+              from pathlib import Path
+              
+              
+              report = json.loads(
+                  Path(
+                      sys.argv[1]
+                  ).read_text(
+                      encoding="utf-8"
+                  )
+              )
+              
+              
+              vulnerabilities = []
+              
+              
+              for result in (
+                  report.get(
+                      "Results",
+                      []
+                  )
+                  or []
+              ):
+              
+                  target = result.get(
+                      "Target",
+                      "N/A"
+                  )
+              
+                  for vuln in (
+                      result.get(
+                          "Vulnerabilities",
+                          []
+                      )
+                      or []
+                  ):
+              
+                      vulnerabilities.append(
+                          {
+                              "target": target,
+              
+                              "id": vuln.get(
+                                  "VulnerabilityID",
+                                  "N/A"
+                              ),
+              
+                              "pkg": vuln.get(
+                                  "PkgName",
+                                  "N/A"
+                              ),
+              
+                              "installed": vuln.get(
+                                  "InstalledVersion",
+                                  "N/A"
+                              ),
+              
+                              "fixed": (
+                                  vuln.get(
+                                      "FixedVersion"
+                                  )
+                                  or "N/A"
+                              ),
+              
+                              "severity": vuln.get(
+                                  "Severity",
+                                  "UNKNOWN"
+                              ),
+                          }
+                      )
+              
+              
+              severities = Counter(
+                  v["severity"]
+                  for v in vulnerabilities
+              )
+              
+              packages = Counter(
+                  v["pkg"]
+                  for v in vulnerabilities
+              )
+              
+              
+              print()
+              
+              print(
+                  f"Vulnerabilidades encontradas:    "
+                  f"{len(vulnerabilities)}"
+              )
+              
+              print()
+              print("Por severidade:")
+              
+              
+              for severity in [
+                  "CRITICAL",
+                  "HIGH",
+                  "MEDIUM",
+                  "LOW",
+                  "UNKNOWN",
+              ]:
+              
+                  if severities.get(
+                      severity
+                  ):
+              
+                      print(
+                          f"  {severity:<15} "
+                          f"{severities[severity]:>5}"
+                      )
+              
+              
+              print()
+              print(
+                  "Pacotes mais afetados:"
+              )
+              
+              for pkg, count in (
+                  packages.most_common(15)
+              ):
+              
+                  print(
+                      f"  {pkg:<50} "
+                      f"{count:>5}"
+                  )
+              
+              
+              if vulnerabilities:
+              
+                  print()
+                  print(
+                      "Principais vulnerabilidades:"
+                  )
+              
+                  for vuln in (
+                      vulnerabilities[:20]
+                  ):
+              
+                      print()
+              
+                      print(
+                          f"[{vuln['severity']}] "
+                          f"{vuln['id']}"
+                      )
+              
+                      print(
+                          f"  Pacote: "
+                          f"{vuln['pkg']}"
+                      )
+              
+                      print(
+                          f"  Instalada: "
+                          f"{vuln['installed']}"
+                      )
+              
+                      print(
+                          f"  Corrigida: "
+                          f"{vuln['fixed']}"
+                      )
+              
+                      print(
+                          f"  Alvo: "
+                          f"{vuln['target']}"
+                      )
+              
+              
+              print()
+              
+              print(
+                  "=================================================="
+              )
+              PYTHON
+
+            displayName: "Exibir resumo consolidado SCA"
+
+            condition: always()
+
+
+          - task: PublishPipelineArtifact@1
+
+            displayName: "Publicar relatório SCA"
+
+            condition: always()
+
+            inputs:
+              targetPath: "$(SECURITY_REPORTS_DIRECTORY)/sca"
+              artifact: "security-sca-trivy"
+              publishLocation: "pipeline"
+
+  # ============================================================
+  # 4. IAC CHECK
+  # ============================================================
+
+  - stage: IaC_Check
+
+    displayName: "4. IaC-Check"
+
+    dependsOn: SCA_Check
+
+    condition: succeededOrFailed()
+
+    jobs:
+
+      - job: TrivyIaC
+        condition: not(canceled())
+
+        displayName: "Trivy - Infraestrutura como código"
+
+        timeoutInMinutes: 30
+
+        steps:
+
+          - checkout: self
+
+            displayName: "Checkout do repositório"
+
+            clean: true
+            fetchDepth: 1
+
+
+          - bash: |
+              set -euo pipefail
+              
+              REPORT_DIRECTORY="$(SECURITY_REPORTS_DIRECTORY)/iac"
+              REPORT_FILE="$REPORT_DIRECTORY/trivy-iac-report.json"
+              
+              mkdir -p "$REPORT_DIRECTORY"
+              mkdir -p "$(TRIVY_CACHE_DIRECTORY)"
+              
+              echo "=================================================="
+              echo "                IAC CHECK - TRIVY"
+              echo "=================================================="
+              echo "Repositório: $(Build.Repository.Name)"
+              echo "Branch: $(Build.SourceBranch)"
+              echo "Commit: $(Build.SourceVersion)"
+              echo "Imagem: $(TRIVY_IMAGE)"
+              echo "Severidades bloqueantes: $(TRIVY_SEVERITIES)"
+              echo "=================================================="
+              
+              docker pull "$(TRIVY_IMAGE)"
+              
+              echo
+              echo "Versão:"
+              
+              docker run --rm \
+                "$(TRIVY_IMAGE)" \
+                --version
+              
+              echo
+              echo "Iniciando análise de IaC..."
+              
+              set +e
+              
+              docker run --rm \
+                --volume "$(Build.SourcesDirectory):/project:ro" \
+                --volume "$REPORT_DIRECTORY:/reports" \
+                --volume "$(TRIVY_CACHE_DIRECTORY):/root/.cache/trivy" \
+                "$(TRIVY_IMAGE)" \
+                config \
+                  --severity "$(TRIVY_SEVERITIES)" \
+                  --exit-code 1 \
+                  --format json \
+                  --output /reports/trivy-iac-report.json \
+                  /project
+              
+              EXIT_CODE=$?
+              
+              set -e
+              
+              if [ ! -f "$REPORT_FILE" ]; then
+              
+                echo "##vso[task.logissue type=error]Relatório IaC não foi gerado."
+              
+                exit 2
+              
+              fi
+              
+              exit "$EXIT_CODE"
+
+            displayName: "Executar Trivy IaC"
+
+
+          - bash: |
+              set -euo pipefail
+              
+              REPORT_FILE="$(SECURITY_REPORTS_DIRECTORY)/iac/trivy-iac-report.json"
+              
+              echo "=================================================="
+              echo "           RESUMO DE SEGURANÇA - IAC"
+              echo "=================================================="
+              
+              if [ ! -f "$REPORT_FILE" ]; then
+              
+                echo "Relatório não encontrado."
+              
+                exit 0
+              
+              fi
+              
+              python3 - "$REPORT_FILE" <<'PYTHON'
+              import json
+              import sys
+              
+              from collections import Counter
+              from pathlib import Path
+              
+              
+              report = json.loads(
+                  Path(
+                      sys.argv[1]
+                  ).read_text(
+                      encoding="utf-8"
+                  )
+              )
+              
+              
+              findings = []
+              
+              
+              for result in (
+                  report.get(
+                      "Results",
+                      []
+                  )
+                  or []
+              ):
+              
+                  target = result.get(
+                      "Target",
+                      "N/A"
+                  )
+              
+                  for finding in (
+                      result.get(
+                          "Misconfigurations",
+                          []
+                      )
+                      or []
+                  ):
+              
+                      findings.append(
+                          {
+                              "target": target,
+              
+                              "id": finding.get(
+                                  "ID",
+                                  "N/A"
+                              ),
+              
+                              "title": finding.get(
+                                  "Title",
+                                  "N/A"
+                              ),
+              
+                              "severity": finding.get(
+                                  "Severity",
+                                  "UNKNOWN"
+                              ),
+              
+                              "resolution": finding.get(
+                                  "Resolution",
+                                  ""
+                              ),
+                          }
+                      )
+              
+              
+              severities = Counter(
+                  f["severity"]
+                  for f in findings
+              )
+              
+              targets = Counter(
+                  f["target"]
+                  for f in findings
+              )
+              
+              
+              print()
+              
+              print(
+                  f"Misconfigurações encontradas:     "
+                  f"{len(findings)}"
+              )
+              
+              print()
+              print(
+                  "Por severidade:"
+              )
+              
+              
+              for severity in [
+                  "CRITICAL",
+                  "HIGH",
+                  "MEDIUM",
+                  "LOW",
+                  "UNKNOWN",
+              ]:
+              
+                  if severities.get(
+                      severity
+                  ):
+              
+                      print(
+                          f"  {severity:<15} "
+                          f"{severities[severity]:>5}"
+                      )
+              
+              
+              print()
+              print(
+                  "Arquivos mais afetados:"
+              )
+              
+              for target, count in (
+                  targets.most_common(15)
+              ):
+              
+                  print(
+                      f"  {target:<70} "
+                      f"{count:>5}"
+                  )
+              
+              
+              if findings:
+              
+                  print()
+                  print(
+                      "Principais configurações inseguras:"
+                  )
+              
+                  for finding in (
+                      findings[:20]
+                  ):
+              
+                      print()
+              
+                      print(
+                          f"[{finding['severity']}] "
+                          f"{finding['id']}"
+                      )
+              
+                      print(
+                          f"  Arquivo: "
+                          f"{finding['target']}"
+                      )
+              
+                      print(
+                          f"  Título: "
+                          f"{finding['title']}"
+                      )
+              
+                      if finding[
+                          "resolution"
+                      ]:
+              
+                          print(
+                              f"  Recomendação: "
+                              f"{finding['resolution']}"
+                          )
+              
+              
+              print()
+              
+              print(
+                  "=================================================="
+              )
+              PYTHON
+
+            displayName: "Exibir resumo consolidado IaC"
+
+            condition: always()
+
+
+          - task: PublishPipelineArtifact@1
+
+            displayName: "Publicar relatório IaC"
+
+            condition: always()
+
+            inputs:
+              targetPath: "$(SECURITY_REPORTS_DIRECTORY)/iac"
+              artifact: "security-iac-trivy"
+              publishLocation: "pipeline"
+
+  # ============================================================
+  # 5. TESTES ANTES DO DEPLOY
+  # ============================================================
+
+  - stage: Integration_Tests
+
+    displayName: "5. Unit & Integration Tests"
+
+    dependsOn:
+      - Secrets_Check
+      - SAST_Check
+      - SCA_Check
+      - IaC_Check
+
+    # Segurança permanece consultiva; testes e build são bloqueantes.
+    condition: succeededOrFailed()
+
+    jobs:
+
+      - job: ValidateAndPackage
+
+        displayName: "Node.js 24 - validação e imagens de release"
+        condition: not(canceled())
+        timeoutInMinutes: 90
+
+        steps:
+
+          - checkout: self
+            clean: true
+            fetchDepth: 1
+
+          - task: NodeTool@0
+            displayName: "Preparar Node.js 24"
+            inputs:
+              versionSpec: "$(NODE_VERSION)"
+              checkLatest: false
+
+          - bash: |
+              set -euo pipefail
+              docker info >/dev/null
+              npm ci
+              npm run build
+              npm run lint
+              npm run typecheck
+            displayName: "Instalar dependências, build, lint e tipos"
+            env:
+              NODE_ENV: development
+              DATABASE_URL: mysql://ci:ci@127.0.0.1:3306/ci
+              DATABASE_DIALECT: mysql
+              DB_USERNAME: ''
+              DB_PASSWORD: ''
+
+          - bash: |
+              set -euo pipefail
+              mkdir -p "$(TEST_RESULTS_DIRECTORY)"
+              npx vitest run --project unit \
+                --reporter default --reporter junit \
+                --outputFile.junit="$(TEST_RESULTS_DIRECTORY)/unit.xml"
+            displayName: "Testes unitários e contratos HTTP"
+            env:
+              NODE_ENV: test
+
+          - bash: |
+              set -euo pipefail
+              mkdir -p "$(TEST_RESULTS_DIRECTORY)"
+              npx vitest run --project integration \
+                --reporter default --reporter junit \
+                --outputFile.junit="$(TEST_RESULTS_DIRECTORY)/integration-mysql.xml"
+            displayName: "Integração - MySQL 8.4 descartável"
+            env:
+              NODE_ENV: test
+              TEST_DATABASE_DIALECT: mysql
+              TEST_DATABASE_SERVER_URL: ''
+              TEST_MYSQL_SERVER_URL: ''
+              TEST_USE_CONFIGURED_DATABASE: 'false'
+              TEST_USE_CONFIGURED_MYSQL: 'false'
+
+          - bash: |
+              set -euo pipefail
+              mkdir -p "$(TEST_RESULTS_DIRECTORY)"
+              npx vitest run --project integration \
+                --reporter default --reporter junit \
+                --outputFile.junit="$(TEST_RESULTS_DIRECTORY)/integration-mariadb.xml"
+            displayName: "Integração - MariaDB 10.11 descartável"
+            env:
+              NODE_ENV: test
+              TEST_DATABASE_DIALECT: mariadb
+              TEST_DATABASE_SERVER_URL: ''
+              TEST_MYSQL_SERVER_URL: ''
+              TEST_USE_CONFIGURED_DATABASE: 'false'
+              TEST_USE_CONFIGURED_MYSQL: 'false'
+
+          - bash: |
+              set -euo pipefail
+              python3 scripts/cicd/test-deploy.py
+            displayName: "Verificar migrations, saúde, rollback e integridade da release"
+
+          - task: PublishTestResults@2
+            displayName: "Publicar resultados dos testes"
+            condition: always()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: "$(TEST_RESULTS_DIRECTORY)/*.xml"
+              mergeTestResults: false
+              failTaskOnFailedTests: true
+              failTaskOnMissingResultsFile: true
+              testRunTitle: "LambdaQuality - unitários e integração"
+
+          - bash: |
+              set -euo pipefail
+              docker build --platform "$DOCKER_PLATFORM" --target runtime \
+                --label "org.opencontainers.image.revision=$(Build.SourceVersion)" \
+                --tag "$API_IMAGE" .
+              docker build --platform "$DOCKER_PLATFORM" --target migrations \
+                --label "org.opencontainers.image.revision=$(Build.SourceVersion)" \
+                --tag "$MIGRATIONS_IMAGE" .
+              docker run --rm --entrypoint node "$API_IMAGE" \
+                --input-type=module -e 'await import("./dist/app.js");'
+              docker run --rm --entrypoint node \
+                -e DATABASE_URL=mysql://ci:ci@127.0.0.1:3306/ci \
+                "$MIGRATIONS_IMAGE" node_modules/prisma/build/index.js --version
+              node scripts/cicd/test-migrations-image.mjs "$MIGRATIONS_IMAGE"
+              mkdir -p "$RELEASE_DIRECTORY/scripts/cicd"
+              cp docker-compose.hml.yml "$RELEASE_DIRECTORY/"
+              cp scripts/cicd/{release.py,prepare-config.py,deploy-common.sh,deploy-hml.sh,rollback-hml.sh} \
+                "$RELEASE_DIRECTORY/scripts/cicd/"
+              docker image save "$API_IMAGE" "$MIGRATIONS_IMAGE" \
+                | gzip -1 > "$RELEASE_DIRECTORY/images.tar.gz"
+              API_ID=$(docker image inspect --format '{{.Id}}' "$API_IMAGE")
+              MIGRATIONS_ID=$(docker image inspect --format '{{.Id}}' "$MIGRATIONS_IMAGE")
+              python3 scripts/cicd/release.py create "$RELEASE_DIRECTORY" \
+                "$RELEASE_ID" "$API_ID" "$MIGRATIONS_ID"
+              python3 scripts/cicd/release.py verify "$RELEASE_DIRECTORY" "$RELEASE_ID"
+            displayName: "Construir, verificar e empacotar imagens Docker"
+            env:
+              DOCKER_PLATFORM: ${{ parameters.dockerPlatform }}
+              RELEASE_ID: "$(RELEASE_ID)"
+              API_IMAGE: "$(API_IMAGE)"
+              MIGRATIONS_IMAGE: "$(MIGRATIONS_IMAGE)"
+              RELEASE_DIRECTORY: "$(RELEASE_DIRECTORY)"
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publicar release validada (sem configurações ou chaves)"
+            inputs:
+              targetPath: "$(RELEASE_DIRECTORY)"
+              artifact: backend-release
+              publishLocation: pipeline
+
+          - bash: |
+              docker image rm "$API_IMAGE" "$MIGRATIONS_IMAGE" >/dev/null 2>&1 || true
+            displayName: "Remover somente imagens temporárias deste run no agente de CI"
+            condition: always()
+            env:
+              API_IMAGE: "$(API_IMAGE)"
+              MIGRATIONS_IMAGE: "$(MIGRATIONS_IMAGE)"
+
+  # ============================================================
+  # 6. DEPLOY BACKEND - HOMOLOGAÇÃO
+  # ============================================================
+
+  - stage: Deploy_Backend_Hml
+
+    displayName: "6. Deploy Backend - Homologação"
+    dependsOn:
+      - Secrets_Check
+      - SAST_Check
+      - SCA_Check
+      - IaC_Check
+      - Integration_Tests
+
+    # Findings não impedem a aprovação manual; testes/build devem ter passado.
+    condition: >-
+      and(not(canceled()),
+          eq(dependencies.Integration_Tests.result, 'Succeeded'),
+          ne(variables['Build.Reason'], 'PullRequest'))
+    lockBehavior: sequential
+
+    jobs:
+
+      - job: WaitForDeployHmlApproval
+        displayName: "Aguardar autorização - Homologação"
+        pool: server
+        condition: not(canceled())
+        timeoutInMinutes: 1441
+        steps:
+          - task: ManualValidation@0
+            displayName: "Autorizar Deploy Backend - Homologação"
+            timeoutInMinutes: 1440
+            inputs:
+              notifyUsers: ''
+              instructions: |
+                Os testes unitários, integrações, build, lint e tipos passaram.
+                Avalie os relatórios de Secrets, SAST, SCA e IaC antes de aprovar.
+                Checks de segurança permanecem consultivos, conforme o padrão atual.
+                O destino é a VM ${{ parameters.hmlVmResource }} do Environment
+                ${{ parameters.hmlEnvironment }}, não uma máquina do pool de CI configurado.
+                Confirme backup do banco e compatibilidade das migrations com a
+                versão anterior, caso seja necessário rollback da aplicação.
+                RESUME autoriza migrations versionadas e publicação da API.
+                REJECT cancela o deploy. O rollback é manual e não reverte dados/DDL.
+              onTimeout: reject
+
+      - deployment: DeployBackendHml
+        displayName: "Publicar na VM de homologação"
+        variables:
+          - group: LambdaQuality-HML
+        dependsOn: WaitForDeployHmlApproval
+        condition: >-
+          and(not(canceled()),
+              eq(dependencies.WaitForDeployHmlApproval.result, 'Succeeded'))
+        timeoutInMinutes: 30
+        environment:
+          name: ${{ parameters.hmlEnvironment }}
+          resourceName: ${{ parameters.hmlVmResource }}
+          resourceType: virtualMachine
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: none
+                - download: none
+                - download: current
+                  artifact: backend-release
+                  displayName: "Obter imagens e scripts deste run na VM de destino"
+                - bash: |
+                    set -euo pipefail
+                    bash "$ARTIFACT_DIRECTORY/scripts/cicd/deploy-hml.sh" \
+                      "$DEPLOY_ROOT" "$ARTIFACT_DIRECTORY" "$RELEASE_ID"
+                  displayName: "Preflight > migrations > nova API > readiness"
+                  env:
+                    DEPLOY_ROOT: ${{ parameters.hmlDeployRoot }}
+                    ARTIFACT_DIRECTORY: "$(Pipeline.Workspace)/backend-release"
+                    RELEASE_ID: "$(RELEASE_ID)"
+                    LAMBDAQUALITY_CONFIG_SOURCE: library
+                    LQ_ENV_TEST_VAULT_ACTIVE_KEY_ID: "$(TEST_VAULT_ACTIVE_KEY_ID)"
+                    LQ_ENV_TEST_VAULT_ENCRYPTION_KEYS: "$(TEST_VAULT_ENCRYPTION_KEYS)"
+                    LQ_ENV_DATABASE_DIALECT: "$(DATABASE_DIALECT)"
+                    LQ_ENV_DATABASE_URL: "$(DATABASE_URL)"
+                    LQ_ENV_DB_URL: "$(DB_URL)"
+                    LQ_ENV_DB_USERNAME: "$(DB_USERNAME)"
+                    LQ_ENV_DB_PASSWORD: "$(DB_PASSWORD)"
+                    LQ_ENV_DB_SSL_CA_PATH: "$(DB_SSL_CA_PATH)"
+                    LQ_ENV_JWT_SECRET: "$(JWT_SECRET)"
+                    LQ_ENV_OTP_HMAC_SECRET: "$(OTP_HMAC_SECRET)"
+                    LQ_ENV_INVITATION_ENCRYPTION_SECRET: "$(INVITATION_ENCRYPTION_SECRET)"
+                    LQ_ENV_JWT_KEY_ID: "$(JWT_KEY_ID)"
+                    LQ_ENV_JWT_ISSUER: "$(JWT_ISSUER)"
+                    LQ_ENV_JWT_AUDIENCE: "$(JWT_AUDIENCE)"
+                    LQ_ENV_ACCESS_TOKEN_TTL_SECONDS: "$(ACCESS_TOKEN_TTL_SECONDS)"
+                    LQ_ENV_SESSION_TTL_SECONDS: "$(SESSION_TTL_SECONDS)"
+                    LQ_ENV_REFRESH_IDLE_TTL_SECONDS: "$(REFRESH_IDLE_TTL_SECONDS)"
+                    LQ_ENV_EMAIL_CODE_TTL_SECONDS: "$(EMAIL_CODE_TTL_SECONDS)"
+                    LQ_ENV_EMAIL_CODE_MAX_ATTEMPTS: "$(EMAIL_CODE_MAX_ATTEMPTS)"
+                    LQ_ENV_EMAIL_CODE_COOLDOWN_SECONDS: "$(EMAIL_CODE_COOLDOWN_SECONDS)"
+                    LQ_ENV_AUTH_RATE_LIMIT: "$(AUTH_RATE_LIMIT)"
+                    LQ_ENV_AUTH_RATE_WINDOW_SECONDS: "$(AUTH_RATE_WINDOW_SECONDS)"
+                    LQ_ENV_SENDGRID_API_KEY: "$(SENDGRID_API_KEY)"
+                    LQ_ENV_SENDGRID_FROM_EMAIL: "$(SENDGRID_FROM_EMAIL)"
+                    LQ_ENV_SENDGRID_FROM_NAME: "$(SENDGRID_FROM_NAME)"
+                    LQ_ENV_MAIL_USERNAME: "$(MAIL_USERNAME)"
+                    LQ_ENV_CORS_ORIGINS: "$(CORS_ORIGINS)"
+                    LQ_ENV_WORKSPACE_RATE_LIMIT: "$(WORKSPACE_RATE_LIMIT)"
+                    LQ_ENV_INVITATION_TTL_SECONDS: "$(INVITATION_TTL_SECONDS)"
+                    LQ_ENV_INVITATION_COOLDOWN_SECONDS: "$(INVITATION_COOLDOWN_SECONDS)"
+                    LQ_ENV_INVITATION_ACCEPT_URL: "$(INVITATION_ACCEPT_URL)"
+                    LQ_ENV_LAMBDAQUALITY_STORAGE_ORACLE_REGION: "$(LAMBDAQUALITY_STORAGE_ORACLE_REGION)"
+                    LQ_ENV_LAMBDAQUALITY_STORAGE_ORACLE_NAMESPACE: "$(LAMBDAQUALITY_STORAGE_ORACLE_NAMESPACE)"
+                    LQ_ENV_LAMBDAQUALITY_STORAGE_ORACLE_BUCKET: "$(LAMBDAQUALITY_STORAGE_ORACLE_BUCKET)"
+                    LQ_ENV_LAMBDAQUALITY_STORAGE_PREFIX: "$(LAMBDAQUALITY_STORAGE_PREFIX)"
+                    LQ_ENV_LAMBDAQUALITY_STORAGE_ORACLE_TENANCY_OCID: "$(LAMBDAQUALITY_STORAGE_ORACLE_TENANCY_OCID)"
+                    LQ_ENV_LAMBDAQUALITY_STORAGE_ORACLE_USER_OCID: "$(LAMBDAQUALITY_STORAGE_ORACLE_USER_OCID)"
+                    LQ_ENV_LAMBDAQUALITY_STORAGE_ORACLE_FINGERPRINT: "$(LAMBDAQUALITY_STORAGE_ORACLE_FINGERPRINT)"
+                    LQ_ENV_LAMBDAQUALITY_STORAGE_ORACLE_PRIVATE_KEY_PASSPHRASE: "$(LAMBDAQUALITY_STORAGE_ORACLE_PRIVATE_KEY_PASSPHRASE)"
+                    LQ_ENV_ATTACHMENT_MAX_BYTES: "$(ATTACHMENT_MAX_BYTES)"
+                    LQ_ENV_ATTACHMENT_RETENTION_DAYS: "$(ATTACHMENT_RETENTION_DAYS)"
+                    LQ_ENV_LAMBDAQUALITY_HTTP_PORT: "$(LAMBDAQUALITY_HTTP_PORT)"
+                    LQ_ENV_LAMBDAQUALITY_BIND_ADDRESS: "$(LAMBDAQUALITY_BIND_ADDRESS)"
+                    LQ_ENV_LAMBDAQUALITY_DOCKER_NETWORK: "$(LAMBDAQUALITY_DOCKER_NETWORK)"
+
+  # ============================================================
+  # 7. ROLLBACK MANUAL/OPCIONAL
+  # ============================================================
+
+  - stage: Rollback_Backend_Hml
+
+    displayName: "7. Rollback Backend - Homologação"
+    trigger: manual
+    condition: not(canceled())
+    lockBehavior: sequential
+
+    jobs:
+      - deployment: RollbackBackendHml
+        displayName: "Retomar aplicação anterior na mesma VM"
+        condition: not(canceled())
+        timeoutInMinutes: 15
+        environment:
+          name: ${{ parameters.hmlEnvironment }}
+          resourceName: ${{ parameters.hmlVmResource }}
+          resourceType: virtualMachine
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: none
+                - download: none
+                - download: current
+                  artifact: backend-release
+                - bash: |
+                    set -euo pipefail
+                    bash "$ARTIFACT_DIRECTORY/scripts/cicd/rollback-hml.sh" \
+                      "$DEPLOY_ROOT" "$RELEASE_ID"
+                  displayName: "Restaurar imagem anterior e validar saúde (sem reverter banco)"
+                  env:
+                    DEPLOY_ROOT: ${{ parameters.hmlDeployRoot }}
+                    ARTIFACT_DIRECTORY: "$(Pipeline.Workspace)/backend-release"
+                    RELEASE_ID: "$(RELEASE_ID)"

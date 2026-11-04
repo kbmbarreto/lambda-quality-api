@@ -1,0 +1,44 @@
+ID,Work Item Type,Title,Test Step,Step Action,Step Expected,Area Path,Assigned To,State
+"5810","Test Case","Validar liberação da visão de custos para usuário de perfil financeiro",,,,"sample-project","Pessoa de teste <tester@example.com>","Design"
+,,,"1","Dado que eu possuo um perfil 'Financeiro'","
+",,,
+,,,"2","Quando acesso o relatório financeiro","
+",,,
+,,,"3","Então devo visualizar o relatório financeiro","
+",,,
+"5812","Test Case","Validar não liberação da visão de custos para usuários sem o perfil financeiro",,,,"sample-project","Pessoa de teste <tester@example.com>","Design"
+,,,"1","Dado que eu não possuo um perfil 'Financeiro'","
+",,,
+,,,"2","Quando acesso o relatório financeiro","
+",,,
+,,,"3","Então não devo visualizar o relatório financeiro","
+",,,
+"5813","Test Case","Validar campos da visão do relatório",,,,"sample-project","Pessoa de teste <tester@example.com>","Design"
+,,,"1","Dado que estou no sistema LambdaClock logado com perfil 'Financeiro'","
+",,,
+,,,"2","Quando acesso o relatório financeiro","
+",,,
+,,,"3","E vejo os componentes da tela","
+",,,
+,,,"4","Então vejo a disposição abaixo: 
+","
+",,,
+"5814","Test Case","Validar filtros da visão de relatório",,,,"sample-project","Pessoa de teste <tester@example.com>","Design"
+,,,"1","Dado que estou no sistema Cllaraclock com perfil 'Financeiro'","
+",,,
+,,,"2","Quando acesso a tela de relatório financeiro","
+",,,
+,,,"3","E vejo os filtros Período, Projeto e Cliente","
+",,,
+,,,"4","Então valido que todos os filtros estão funcionando corretamente","
+",,,
+"5815","Test Case","Validar exportação para Excel com sucesso",,,,"sample-project","Pessoa de teste <tester@example.com>","Design"
+,,,"1","Dado que acesso o sistema LambdaClock com o perfil 'Financeiro'","
+",,,
+,,,"2","Quando acesso a tela de relatório financeiro","
+",,,
+,,,"3","E exporto o relatório para Excel","
+",,,
+,,,"4","Então abro o relatório e vejo os seguintes campos: 
+","
+",,,

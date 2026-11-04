@@ -1,0 +1,1020 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "esm"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum EmailCodePurpose {
+  REGISTRATION
+  PASSWORD_RESET
+}
+
+model User {
+  id                String            @id @db.Char(36)
+  email             String            @unique @db.VarChar(254)
+  displayName       String            @map("display_name") @db.VarChar(100)
+  passwordHash      String            @map("password_hash") @db.VarChar(255)
+  status            UserStatus        @default(ACTIVE)
+  emailVerifiedAt   DateTime          @map("email_verified_at") @db.DateTime(3)
+  passwordChangedAt DateTime          @map("password_changed_at") @db.DateTime(3)
+  createdAt         DateTime          @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt         DateTime          @updatedAt @map("updated_at") @db.DateTime(3)
+  sessions          AuthSession[]
+  workspaceMembers  WorkspaceMember[]
+
+  @@map("users")
+}
+
+model AuthSession {
+  id           String         @id @db.Char(36)
+  userId       String         @map("user_id") @db.Char(36)
+  createdAt    DateTime       @default(now()) @map("created_at") @db.DateTime(3)
+  expiresAt    DateTime       @map("expires_at") @db.DateTime(3)
+  lastUsedAt   DateTime       @map("last_used_at") @db.DateTime(3)
+  revokedAt    DateTime?      @map("revoked_at") @db.DateTime(3)
+  revokeReason String?        @map("revoke_reason") @db.VarChar(50)
+  user         User           @relation(fields: [userId], references: [id], onDelete: Restrict)
+  tokens       RefreshToken[]
+
+  @@index([userId, revokedAt, expiresAt])
+  @@map("auth_sessions")
+}
+
+model RefreshToken {
+  id                String         @id @db.Char(36)
+  sessionId         String         @map("session_id") @db.Char(36)
+  tokenHash         String         @unique @map("token_hash") @db.Char(64)
+  createdAt         DateTime       @default(now()) @map("created_at") @db.DateTime(3)
+  expiresAt         DateTime       @map("expires_at") @db.DateTime(3)
+  consumedAt        DateTime?      @map("consumed_at") @db.DateTime(3)
+  revokedAt         DateTime?      @map("revoked_at") @db.DateTime(3)
+  replacedByTokenId String?        @map("replaced_by_token_id") @db.Char(36)
+  session           AuthSession    @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  successor         RefreshToken?  @relation("RefreshReplacement", fields: [sessionId, replacedByTokenId], references: [sessionId, id], onDelete: NoAction, onUpdate: NoAction)
+  predecessors      RefreshToken[] @relation("RefreshReplacement")
+
+  @@unique([sessionId, id])
+  @@index([sessionId, expiresAt])
+  @@map("refresh_tokens")
+}
+
+model EmailChallenge {
+  id         String           @id @db.Char(36)
+  email      String           @db.VarChar(254)
+  purpose    EmailCodePurpose
+  codeHash   String           @map("code_hash") @db.Char(64)
+  attempts   Int              @default(0)
+  eligible   Boolean
+  createdAt  DateTime         @default(now()) @map("created_at") @db.DateTime(3)
+  expiresAt  DateTime         @map("expires_at") @db.DateTime(3)
+  consumedAt DateTime?        @map("consumed_at") @db.DateTime(3)
+  revokedAt  DateTime?        @map("revoked_at") @db.DateTime(3)
+
+  @@index([email, purpose, createdAt])
+  @@map("email_challenges")
+}
+
+model EmailCodeScope {
+  id              String    @id @db.Char(64)
+  lastRequestedAt DateTime? @map("last_requested_at") @db.DateTime(3)
+
+  @@map("email_code_scopes")
+}
+
+model AuditEvent {
+  id            String   @id @db.Char(36)
+  workspaceId   String?  @map("workspace_id") @db.Char(36)
+  actorUserId   String?  @map("actor_user_id") @db.Char(36)
+  action        String   @db.VarChar(80)
+  entityType    String   @map("entity_type") @db.VarChar(50)
+  entityId      String   @map("entity_id") @db.Char(36)
+  occurredAt    DateTime @default(now()) @map("occurred_at") @db.DateTime(3)
+  correlationId String   @map("correlation_id") @db.Char(36)
+
+  @@index([workspaceId, occurredAt])
+  @@index([actorUserId, occurredAt])
+  @@map("audit_events")
+}
+
+model Workspace {
+  governanceFrameworks GovernanceFramework[]
+  governanceGoals      GovernanceGoal[]
+  actionPlans          ActionPlan[]
+  id                   String                  @id @db.Char(36)
+  name                 String                  @db.VarChar(100)
+  slug                 String                  @unique @db.VarChar(80)
+  status               String                  @default("ACTIVE") @db.VarChar(20)
+  ownerMemberId        String?                 @map("owner_member_id") @db.Char(36)
+  createdAt            DateTime                @map("created_at") @db.DateTime(3)
+  updatedAt            DateTime                @map("updated_at") @db.DateTime(3)
+  members              WorkspaceMember[]       @relation("Membership")
+  owner                WorkspaceMember?        @relation("Ownership", fields: [id, ownerMemberId], references: [workspaceId, id], onDelete: NoAction, onUpdate: NoAction)
+  roles                Role[]
+  groups               WorkspaceGroup[]
+  invitations          Invitation[]
+  fields               CustomFieldDefinition[]
+  tags                 Tag[]
+  attachments          Attachment[]
+  projects             Project[]
+
+  @@map("workspaces")
+}
+
+model WorkspaceMember {
+  governanceGoals GovernanceGoal[]
+  actionPlans     ActionPlan[]
+  id              String           @id @db.Char(36)
+  workspaceId     String           @map("workspace_id") @db.Char(36)
+  userId          String           @map("user_id") @db.Char(36)
+  status          String           @default("ACTIVE") @db.VarChar(20)
+  joinedAt        DateTime         @map("joined_at") @db.DateTime(3)
+  workspace       Workspace        @relation("Membership", fields: [workspaceId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  user            User             @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  ownedWorkspaces Workspace[]      @relation("Ownership")
+  roles           MemberRole[]
+  groups          GroupMember[]
+  projects        ProjectMember[]
+
+  @@unique([workspaceId, id])
+  @@unique([workspaceId, userId])
+  @@index([workspaceId, status])
+  @@map("workspace_members")
+}
+
+model Permission {
+  id              String           @id @db.Char(36)
+  code            String           @unique @db.VarChar(80)
+  description     String           @db.VarChar(200)
+  rolePermissions RolePermission[]
+
+  @@map("permissions")
+}
+
+model Role {
+  id             String           @id @db.Char(36)
+  workspaceId    String           @map("workspace_id") @db.Char(36)
+  name           String           @db.VarChar(100)
+  normalizedName String           @map("normalized_name") @db.VarChar(100)
+  description    String?          @db.VarChar(500)
+  systemRole     Boolean          @map("system_role")
+  createdAt      DateTime         @map("created_at") @db.DateTime(3)
+  workspace      Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  permissions    RolePermission[]
+  members        MemberRole[]
+  groups         GroupRole[]
+
+  @@unique([workspaceId, id])
+  @@unique([workspaceId, normalizedName])
+  @@map("roles")
+}
+
+model WorkspaceGroup {
+  id             String        @id @db.Char(36)
+  workspaceId    String        @map("workspace_id") @db.Char(36)
+  name           String        @db.VarChar(100)
+  normalizedName String        @map("normalized_name") @db.VarChar(100)
+  description    String?       @db.VarChar(500)
+  createdAt      DateTime      @map("created_at") @db.DateTime(3)
+  workspace      Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  members        GroupMember[]
+  roles          GroupRole[]
+
+  @@unique([workspaceId, id])
+  @@unique([workspaceId, normalizedName])
+  @@map("groups")
+}
+
+model RolePermission {
+  id             String     @id @db.Char(36)
+  workspaceId    String     @map("workspace_id") @db.Char(36)
+  roleId         String     @map("role_id") @db.Char(36)
+  permissionCode String     @map("permission_code") @db.VarChar(80)
+  role           Role       @relation(fields: [workspaceId, roleId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+  permission     Permission @relation(fields: [permissionCode], references: [code], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([workspaceId, roleId, permissionCode])
+  @@map("role_permissions")
+}
+
+model MemberRole {
+  id          String          @id @db.Char(36)
+  workspaceId String          @map("workspace_id") @db.Char(36)
+  memberId    String          @map("member_id") @db.Char(36)
+  roleId      String          @map("role_id") @db.Char(36)
+  member      WorkspaceMember @relation(fields: [workspaceId, memberId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+  role        Role            @relation(fields: [workspaceId, roleId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([workspaceId, memberId, roleId])
+  @@index([workspaceId, roleId])
+  @@map("member_roles")
+}
+
+model GroupMember {
+  id          String          @id @db.Char(36)
+  workspaceId String          @map("workspace_id") @db.Char(36)
+  groupId     String          @map("group_id") @db.Char(36)
+  memberId    String          @map("member_id") @db.Char(36)
+  group       WorkspaceGroup  @relation(fields: [workspaceId, groupId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+  member      WorkspaceMember @relation(fields: [workspaceId, memberId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([workspaceId, groupId, memberId])
+  @@index([workspaceId, memberId])
+  @@map("group_members")
+}
+
+model GroupRole {
+  id          String         @id @db.Char(36)
+  workspaceId String         @map("workspace_id") @db.Char(36)
+  groupId     String         @map("group_id") @db.Char(36)
+  roleId      String         @map("role_id") @db.Char(36)
+  group       WorkspaceGroup @relation(fields: [workspaceId, groupId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+  role        Role           @relation(fields: [workspaceId, roleId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([workspaceId, groupId, roleId])
+  @@index([workspaceId, roleId])
+  @@map("group_roles")
+}
+
+model Invitation {
+  id               String    @id @db.Char(36)
+  workspaceId      String    @map("workspace_id") @db.Char(36)
+  email            String    @db.VarChar(254)
+  tokenHash        String    @unique @map("token_hash") @db.Char(64)
+  status           String    @default("PENDING") @db.VarChar(20)
+  expiresAt        DateTime  @map("expires_at") @db.DateTime(3)
+  invitedBy        String    @map("invited_by") @db.Char(36)
+  acceptedBy       String?   @map("accepted_by") @db.Char(36)
+  acceptedAt       DateTime? @map("accepted_at") @db.DateTime(3)
+  createdAt        DateTime  @map("created_at") @db.DateTime(3)
+  lastSentAt       DateTime  @map("last_sent_at") @db.DateTime(3)
+  deliveryStatus   String    @map("delivery_status") @db.VarChar(20)
+  deliveryPayload  String?   @map("delivery_payload") @db.Text
+  deliveryAttempts Int       @default(0) @map("delivery_attempts")
+  workspace        Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([workspaceId, id])
+  @@index([workspaceId, email, status])
+  @@index([deliveryStatus, lastSentAt])
+  @@map("invitations")
+}
+
+model CustomFieldDefinition {
+  id          String               @id @db.Char(36)
+  workspaceId String               @map("workspace_id") @db.Char(36)
+  key         String               @db.VarChar(80)
+  name        String               @db.VarChar(100)
+  description String?              @db.VarChar(500)
+  type        String               @db.VarChar(30)
+  target      String               @db.VarChar(30)
+  required    Boolean
+  position    Int
+  options     Json
+  archivedAt  DateTime?            @map("archived_at") @db.DateTime(3)
+  createdAt   DateTime             @map("created_at") @db.DateTime(3)
+  updatedAt   DateTime             @map("updated_at") @db.DateTime(3)
+  workspace   Workspace            @relation(fields: [workspaceId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  caseValues  TestCaseFieldValue[]
+
+  @@unique([workspaceId, id])
+  @@unique([workspaceId, target, key])
+  @@index([workspaceId, archivedAt])
+  @@map("custom_field_definitions")
+}
+
+model Tag {
+  id             String        @id @db.Char(36)
+  workspaceId    String        @map("workspace_id") @db.Char(36)
+  name           String        @db.VarChar(100)
+  normalizedName String        @map("normalized_name") @db.VarChar(100)
+  createdAt      DateTime      @map("created_at") @db.DateTime(3)
+  updatedAt      DateTime      @map("updated_at") @db.DateTime(3)
+  workspace      Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  caseTags       TestCaseTag[]
+
+  @@unique([workspaceId, id])
+  @@unique([workspaceId, normalizedName])
+  @@map("tags")
+}
+
+model Attachment {
+  evidenceLinks   EvidenceLink[]
+  defectLinks     DefectAttachment[]
+  id              String               @id @db.Char(36)
+  workspaceId     String               @map("workspace_id") @db.Char(36)
+  storageKey      String               @unique @map("storage_key") @db.VarChar(100)
+  originalName    String               @map("original_name") @db.VarChar(255)
+  contentType     String               @map("content_type") @db.VarChar(100)
+  sizeBytes       Int                  @map("size_bytes")
+  checksum        String               @db.Char(64)
+  uploadedBy      String               @map("uploaded_by") @db.Char(36)
+  createdAt       DateTime             @map("created_at") @db.DateTime(3)
+  deletedAt       DateTime?            @map("deleted_at") @db.DateTime(3)
+  workspace       Workspace            @relation(fields: [workspaceId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  caseAttachments TestCaseAttachment[]
+
+  @@unique([workspaceId, id])
+  @@index([workspaceId, deletedAt, createdAt])
+  @@map("attachments")
+}
+
+model Project {
+  governanceGoals GovernanceGoal[]
+  defects         Defect[]
+  testPlans       TestPlan[]
+  testRuns        TestRun[]
+  id              String            @id @db.Char(36)
+  workspaceId     String            @map("workspace_id") @db.Char(36)
+  key             String            @db.VarChar(12)
+  name            String            @db.VarChar(100)
+  description     String?           @db.VarChar(500)
+  status          String            @db.VarChar(20)
+  createdAt       DateTime          @map("created_at") @db.DateTime(3)
+  updatedAt       DateTime          @map("updated_at") @db.DateTime(3)
+  archivedAt      DateTime?         @map("archived_at") @db.DateTime(3)
+  workspace       Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  members         ProjectMember[]
+  milestones      Milestone[]
+  environments    Environment[]
+  testSuites      TestSuite[]
+  vaultEntries    TestVaultEntry[]
+  caseImports     TestCaseImport[]
+  testCases       TestCase[]
+  counters        SequenceCounter[]
+
+  @@unique([workspaceId, id])
+  @@unique([workspaceId, key])
+  @@index([workspaceId, status])
+  @@map("projects")
+}
+
+model ProjectMember {
+  id                String          @id @db.Char(36)
+  workspaceId       String          @map("workspace_id") @db.Char(36)
+  projectId         String          @map("project_id") @db.Char(36)
+  workspaceMemberId String          @map("workspace_member_id") @db.Char(36)
+  projectRole       String          @map("project_role") @db.VarChar(20)
+  createdAt         DateTime        @map("created_at") @db.DateTime(3)
+  updatedAt         DateTime        @map("updated_at") @db.DateTime(3)
+  project           Project         @relation(fields: [workspaceId, projectId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+  member            WorkspaceMember @relation(fields: [workspaceId, workspaceMemberId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([workspaceId, projectId, workspaceMemberId])
+  @@unique([workspaceId, projectId, id])
+  @@index([workspaceId, workspaceMemberId])
+  @@map("project_members")
+}
+
+model Milestone {
+  testPlans   TestPlan[]
+  testRuns    TestRun[]
+  id          String     @id @db.Char(36)
+  workspaceId String     @map("workspace_id") @db.Char(36)
+  projectId   String     @map("project_id") @db.Char(36)
+  name        String     @db.VarChar(100)
+  description String?    @db.VarChar(500)
+  status      String     @db.VarChar(20)
+  startDate   DateTime?  @map("start_date") @db.Date
+  dueDate     DateTime?  @map("due_date") @db.Date
+  completedAt DateTime?  @map("completed_at") @db.DateTime(3)
+  createdAt   DateTime   @map("created_at") @db.DateTime(3)
+  updatedAt   DateTime   @map("updated_at") @db.DateTime(3)
+  deletedAt   DateTime?  @map("deleted_at") @db.DateTime(3)
+  project     Project    @relation(fields: [workspaceId, projectId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([workspaceId, projectId, id])
+  @@index([workspaceId, projectId, deletedAt, status])
+  @@map("milestones")
+}
+
+model Environment {
+  vaultEntries TestVaultEntry[]
+  category       String     @default("OTHER") @db.VarChar(20)
+  defects        Defect[]
+  testPlans      TestPlan[]
+  testRuns       TestRun[]
+  id             String     @id @db.Char(36)
+  workspaceId    String     @map("workspace_id") @db.Char(36)
+  projectId      String     @map("project_id") @db.Char(36)
+  name           String     @db.VarChar(100)
+  normalizedName String     @map("normalized_name") @db.VarChar(100)
+  description    String?    @db.VarChar(500)
+  active         Boolean
+  createdAt      DateTime   @map("created_at") @db.DateTime(3)
+  updatedAt      DateTime   @map("updated_at") @db.DateTime(3)
+  deletedAt      DateTime?  @map("deleted_at") @db.DateTime(3)
+  project        Project    @relation(fields: [workspaceId, projectId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([workspaceId, projectId, id])
+  @@unique([workspaceId, projectId, normalizedName])
+  @@index([workspaceId, projectId, deletedAt, active])
+  @@map("environments")
+}
+
+model TestSuite {
+  id            String      @id @db.Char(36)
+  workspaceId   String      @map("workspace_id") @db.Char(36)
+  projectId     String      @map("project_id") @db.Char(36)
+  parentSuiteId String?     @map("parent_suite_id") @db.Char(36)
+  name          String      @db.VarChar(100)
+  description   String?     @db.Text
+  position      Int
+  createdAt     DateTime    @map("created_at") @db.DateTime(3)
+  updatedAt     DateTime    @map("updated_at") @db.DateTime(3)
+  archivedAt    DateTime?   @map("archived_at") @db.DateTime(3)
+  project       Project     @relation(fields: [workspaceId, projectId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+  parent        TestSuite?  @relation("SuiteTree", fields: [workspaceId, projectId, parentSuiteId], references: [workspaceId, projectId, id], onDelete: NoAction, onUpdate: NoAction)
+  children      TestSuite[] @relation("SuiteTree")
+  cases         TestCase[]
+
+  @@unique([workspaceId, projectId, id])
+  @@index([workspaceId, projectId, parentSuiteId, archivedAt, position], map: "test_suites_tree_idx")
+  @@map("test_suites")
+}
+
+model TestCase {
+  planCases        TestPlanCase[]
+  runCases         TestRunCase[]
+  id               String               @id @db.Char(36)
+  workspaceId      String               @map("workspace_id") @db.Char(36)
+  projectId        String               @map("project_id") @db.Char(36)
+  suiteId          String?              @map("suite_id") @db.Char(36)
+  sequence         Int
+  title            String               @db.VarChar(250)
+  description      String?              @db.Text
+  preconditions    String?              @db.Text
+  postconditions   String?              @db.Text
+  severity         String               @db.VarChar(20)
+  priority         String               @db.VarChar(20)
+  status           String               @db.VarChar(20)
+  type             String               @db.VarChar(30)
+  layer            String               @db.VarChar(20)
+  behavior         String?              @db.VarChar(100)
+  automationStatus String               @map("automation_status") @db.VarChar(30)
+  createdBy        String               @map("created_by") @db.Char(36)
+  version          Int
+  createdAt        DateTime             @map("created_at") @db.DateTime(3)
+  updatedAt        DateTime             @map("updated_at") @db.DateTime(3)
+  archivedAt       DateTime?            @map("archived_at") @db.DateTime(3)
+  project          Project              @relation(fields: [workspaceId, projectId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+  suite            TestSuite?           @relation(fields: [workspaceId, projectId, suiteId], references: [workspaceId, projectId, id], onDelete: NoAction, onUpdate: NoAction)
+  steps            TestStep[]
+  tags             TestCaseTag[]
+  attachments      TestCaseAttachment[]
+  fieldValues      TestCaseFieldValue[]
+
+  @@unique([workspaceId, projectId, id])
+  @@unique([workspaceId, projectId, sequence])
+  @@index([workspaceId, projectId, status])
+  @@index([workspaceId, projectId, suiteId])
+  @@map("test_cases")
+}
+
+model TestStep {
+  id             String   @id @db.Char(36)
+  workspaceId    String   @map("workspace_id") @db.Char(36)
+  projectId      String   @map("project_id") @db.Char(36)
+  testCaseId     String   @map("test_case_id") @db.Char(36)
+  position       Int
+  action         String   @db.Text
+  testData       String?  @map("test_data") @db.Text
+  expectedResult String?  @map("expected_result") @db.Text
+  testCase       TestCase @relation(fields: [workspaceId, projectId, testCaseId], references: [workspaceId, projectId, id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([workspaceId, projectId, id])
+  @@unique([workspaceId, testCaseId, position])
+  @@map("test_steps")
+}
+
+model TestCaseTag {
+  id          String   @id @db.Char(36)
+  workspaceId String   @map("workspace_id") @db.Char(36)
+  projectId   String   @map("project_id") @db.Char(36)
+  testCaseId  String   @map("test_case_id") @db.Char(36)
+  tagId       String   @map("tag_id") @db.Char(36)
+  testCase    TestCase @relation(fields: [workspaceId, projectId, testCaseId], references: [workspaceId, projectId, id], onDelete: Restrict, onUpdate: NoAction)
+  tag         Tag      @relation(fields: [workspaceId, tagId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([workspaceId, projectId, testCaseId, tagId], map: "test_case_tags_link_key")
+  @@map("test_case_tags")
+}
+
+model TestCaseAttachment {
+  id           String     @id @db.Char(36)
+  workspaceId  String     @map("workspace_id") @db.Char(36)
+  projectId    String     @map("project_id") @db.Char(36)
+  testCaseId   String     @map("test_case_id") @db.Char(36)
+  attachmentId String     @map("attachment_id") @db.Char(36)
+  testCase     TestCase   @relation(fields: [workspaceId, projectId, testCaseId], references: [workspaceId, projectId, id], onDelete: Restrict, onUpdate: NoAction)
+  attachment   Attachment @relation(fields: [workspaceId, attachmentId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([workspaceId, projectId, testCaseId, attachmentId], map: "test_case_attachments_link_key")
+  @@map("test_case_attachments")
+}
+
+model TestCaseFieldValue {
+  id          String                @id @db.Char(36)
+  workspaceId String                @map("workspace_id") @db.Char(36)
+  projectId   String                @map("project_id") @db.Char(36)
+  testCaseId  String                @map("test_case_id") @db.Char(36)
+  fieldId     String                @map("field_id") @db.Char(36)
+  value       Json
+  testCase    TestCase              @relation(fields: [workspaceId, projectId, testCaseId], references: [workspaceId, projectId, id], onDelete: Restrict, onUpdate: NoAction)
+  field       CustomFieldDefinition @relation(fields: [workspaceId, fieldId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([workspaceId, projectId, testCaseId, fieldId], map: "test_case_field_values_link_key")
+  @@map("test_case_field_values")
+}
+
+model SequenceCounter {
+  id          String  @id @db.Char(36)
+  workspaceId String  @map("workspace_id") @db.Char(36)
+  projectId   String  @map("project_id") @db.Char(36)
+  entityType  String  @map("entity_type") @db.VarChar(30)
+  nextValue   Int     @map("next_value")
+  project     Project @relation(fields: [workspaceId, projectId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([workspaceId, projectId, entityType], map: "sequence_counters_scope_key")
+  @@map("sequence_counters")
+}
+
+model TestPlan {
+  id            String         @id @db.Char(36)
+  workspaceId   String         @map("workspace_id") @db.Char(36)
+  projectId     String         @map("project_id") @db.Char(36)
+  milestoneId   String?        @map("milestone_id") @db.Char(36)
+  environmentId String?        @map("environment_id") @db.Char(36)
+  name          String         @db.VarChar(100)
+  description   String?        @db.Text
+  status        String         @db.VarChar(20)
+  version       Int
+  createdBy     String         @map("created_by") @db.Char(36)
+  createdAt     DateTime       @map("created_at") @db.DateTime(3)
+  updatedAt     DateTime       @map("updated_at") @db.DateTime(3)
+  activatedAt   DateTime?      @map("activated_at") @db.DateTime(3)
+  completedAt   DateTime?      @map("completed_at") @db.DateTime(3)
+  archivedAt    DateTime?      @map("archived_at") @db.DateTime(3)
+  project       Project        @relation(fields: [workspaceId, projectId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+  milestone     Milestone?     @relation(fields: [workspaceId, projectId, milestoneId], references: [workspaceId, projectId, id], onDelete: NoAction, onUpdate: NoAction)
+  environment   Environment?   @relation(fields: [workspaceId, projectId, environmentId], references: [workspaceId, projectId, id], onDelete: NoAction, onUpdate: NoAction)
+  cases         TestPlanCase[]
+  runs          TestRun[]
+
+  @@unique([workspaceId, projectId, id])
+  @@index([workspaceId, projectId, status])
+  @@map("test_plans")
+}
+
+model TestPlanCase {
+  id          String   @id @db.Char(36)
+  workspaceId String   @map("workspace_id") @db.Char(36)
+  projectId   String   @map("project_id") @db.Char(36)
+  testPlanId  String   @map("test_plan_id") @db.Char(36)
+  testCaseId  String   @map("test_case_id") @db.Char(36)
+  position    Int
+  plan        TestPlan @relation(fields: [workspaceId, projectId, testPlanId], references: [workspaceId, projectId, id], onDelete: Restrict, onUpdate: NoAction)
+  testCase    TestCase @relation(fields: [workspaceId, projectId, testCaseId], references: [workspaceId, projectId, id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([workspaceId, testPlanId, testCaseId])
+  @@unique([workspaceId, testPlanId, position])
+  @@map("test_plan_cases")
+}
+
+model TestRun {
+  id                  String             @id @db.Char(36)
+  workspaceId         String             @map("workspace_id") @db.Char(36)
+  projectId           String             @map("project_id") @db.Char(36)
+  testPlanId          String?            @map("test_plan_id") @db.Char(36)
+  milestoneId         String?            @map("milestone_id") @db.Char(36)
+  environmentId       String?            @map("environment_id") @db.Char(36)
+  planNameSnapshot    String?            @map("plan_name_snapshot") @db.VarChar(100)
+  milestoneSnapshot   Json?              @map("milestone_snapshot")
+  environmentSnapshot Json?              @map("environment_snapshot")
+  name                String             @db.VarChar(100)
+  source              String             @db.VarChar(30)
+  externalRunRef      String?            @map("external_run_ref") @db.VarChar(250)
+  status              String             @db.VarChar(20)
+  version             Int
+  createdBy           String             @map("created_by") @db.Char(36)
+  createdAt           DateTime           @map("created_at") @db.DateTime(3)
+  updatedAt           DateTime           @map("updated_at") @db.DateTime(3)
+  startedAt           DateTime?          @map("started_at") @db.DateTime(3)
+  finishedAt          DateTime?          @map("finished_at") @db.DateTime(3)
+  project             Project            @relation(fields: [workspaceId, projectId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+  plan                TestPlan?          @relation(fields: [workspaceId, projectId, testPlanId], references: [workspaceId, projectId, id], onDelete: NoAction, onUpdate: NoAction)
+  milestone           Milestone?         @relation(fields: [workspaceId, projectId, milestoneId], references: [workspaceId, projectId, id], onDelete: NoAction, onUpdate: NoAction)
+  environment         Environment?       @relation(fields: [workspaceId, projectId, environmentId], references: [workspaceId, projectId, id], onDelete: NoAction, onUpdate: NoAction)
+  resultImports       TestResultImport[]
+  cases               TestRunCase[]
+  comments            ExecutionComment[]
+
+  @@unique([workspaceId, projectId, id])
+  @@index([workspaceId, projectId, status])
+  @@index([workspaceId, projectId, testPlanId])
+  @@index([workspaceId, projectId, createdAt], map: "test_runs_dashboard_period_idx")
+  @@map("test_runs")
+}
+
+model TestRunCase {
+  defects              Defect[]
+  id                   String             @id @db.Char(36)
+  workspaceId          String             @map("workspace_id") @db.Char(36)
+  projectId            String             @map("project_id") @db.Char(36)
+  testRunId            String             @map("test_run_id") @db.Char(36)
+  testCaseId           String             @map("test_case_id") @db.Char(36)
+  position             Int
+  caseSequenceSnapshot Int                @map("case_sequence_snapshot")
+  humanIdSnapshot      String             @map("human_id_snapshot") @db.VarChar(30)
+  titleSnapshot        String             @map("title_snapshot") @db.VarChar(250)
+  severitySnapshot     String             @map("severity_snapshot") @db.VarChar(20)
+  prioritySnapshot     String             @map("priority_snapshot") @db.VarChar(20)
+  definitionSnapshot   Json               @map("definition_snapshot")
+  customFieldsSnapshot Json               @map("custom_fields_snapshot")
+  tagsSnapshot         Json               @map("tags_snapshot")
+  resultOrigin         String             @default("MANUAL") @map("result_origin") @db.VarChar(20)
+  externalResult       Json?              @map("external_result")
+  result               String             @db.VarChar(20)
+  executedBy           String?            @map("executed_by") @db.Char(36)
+  executedAt           DateTime?          @map("executed_at") @db.DateTime(3)
+  comment              String?            @db.Text
+  createdAt            DateTime           @map("created_at") @db.DateTime(3)
+  updatedAt            DateTime           @map("updated_at") @db.DateTime(3)
+  run                  TestRun            @relation(fields: [workspaceId, projectId, testRunId], references: [workspaceId, projectId, id], onDelete: Restrict, onUpdate: NoAction)
+  testCase             TestCase           @relation(fields: [workspaceId, projectId, testCaseId], references: [workspaceId, projectId, id], onDelete: Restrict, onUpdate: NoAction)
+  steps                TestRunStep[]
+  comments             ExecutionComment[]
+
+  @@unique([workspaceId, projectId, id], map: "run_cases_defect_scope_key")
+  @@unique([workspaceId, projectId, testRunId, id], map: "run_cases_scope_key")
+  @@unique([workspaceId, testRunId, testCaseId])
+  @@unique([workspaceId, testRunId, position])
+  @@index([workspaceId, testRunId, result])
+  @@index([workspaceId, projectId, executedAt, testCaseId, result], map: "run_cases_dashboard_coverage_idx")
+  @@map("test_run_cases")
+}
+
+model TestRunStep {
+  id                     String             @id @db.Char(36)
+  workspaceId            String             @map("workspace_id") @db.Char(36)
+  projectId              String             @map("project_id") @db.Char(36)
+  testRunId              String             @map("test_run_id") @db.Char(36)
+  testRunCaseId          String             @map("test_run_case_id") @db.Char(36)
+  sourceStepId           String             @map("source_step_id") @db.Char(36)
+  position               Int
+  actionSnapshot         String             @map("action_snapshot") @db.Text
+  testDataSnapshot       String?            @map("test_data_snapshot") @db.Text
+  expectedResultSnapshot String?            @map("expected_result_snapshot") @db.Text
+  actualResult           String?            @map("actual_result") @db.Text
+  result                 String             @db.VarChar(20)
+  comment                String?            @db.Text
+  executedBy             String?            @map("executed_by") @db.Char(36)
+  executedAt             DateTime?          @map("executed_at") @db.DateTime(3)
+  runCase                TestRunCase        @relation(fields: [workspaceId, projectId, testRunId, testRunCaseId], references: [workspaceId, projectId, testRunId, id], onDelete: Restrict, onUpdate: NoAction)
+  comments               ExecutionComment[]
+
+  @@unique([workspaceId, projectId, testRunId, testRunCaseId, id], map: "run_steps_scope_key")
+  @@unique([workspaceId, testRunCaseId, position])
+  @@map("test_run_steps")
+}
+
+model ExecutionComment {
+  id          String       @id @db.Char(36)
+  workspaceId String       @map("workspace_id") @db.Char(36)
+  projectId   String       @map("project_id") @db.Char(36)
+  testRunId   String       @map("test_run_id") @db.Char(36)
+  runCaseId   String?      @map("run_case_id") @db.Char(36)
+  runStepId   String?      @map("run_step_id") @db.Char(36)
+  text        String       @db.Text
+  createdBy   String       @map("created_by") @db.Char(36)
+  createdAt   DateTime     @map("created_at") @db.DateTime(3)
+  run         TestRun      @relation(fields: [workspaceId, projectId, testRunId], references: [workspaceId, projectId, id], onDelete: Restrict, onUpdate: NoAction)
+  runCase     TestRunCase? @relation(map: "execution_comments_case_fk", fields: [workspaceId, projectId, testRunId, runCaseId], references: [workspaceId, projectId, testRunId, id], onDelete: NoAction, onUpdate: NoAction)
+  runStep     TestRunStep? @relation(map: "execution_comments_step_fk", fields: [workspaceId, projectId, testRunId, runCaseId, runStepId], references: [workspaceId, projectId, testRunId, testRunCaseId, id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([workspaceId, projectId, testRunId, createdAt], map: "execution_comments_list_idx")
+  @@map("execution_comments")
+}
+
+model Defect {
+  environmentId       String?            @map("environment_id") @db.Char(36)
+  environmentSnapshot Json?              @map("environment_snapshot")
+  environment         Environment?       @relation(fields: [workspaceId, projectId, environmentId], references: [workspaceId, projectId, id], onDelete: NoAction, onUpdate: NoAction, map: "defects_environment_fk")
+  id                  String             @id @db.Char(36)
+  workspaceId         String             @map("workspace_id") @db.Char(36)
+  projectId           String             @map("project_id") @db.Char(36)
+  sequence            Int
+  title               String             @db.VarChar(250)
+  description         String?            @db.Text
+  severity            String             @db.VarChar(20)
+  status              String             @db.VarChar(20)
+  testRunCaseId       String?            @map("test_run_case_id") @db.Char(36)
+  externalSystem      String?            @map("external_system") @db.VarChar(50)
+  externalIssueId     String?            @map("external_issue_id") @db.VarChar(250)
+  externalUrl         String?            @map("external_url") @db.VarChar(2048)
+  version             Int
+  createdBy           String             @map("created_by") @db.Char(36)
+  createdAt           DateTime           @map("created_at") @db.DateTime(3)
+  resolvedAt          DateTime?          @map("resolved_at") @db.DateTime(3)
+  updatedAt           DateTime           @map("updated_at") @db.DateTime(3)
+  project             Project            @relation(fields: [workspaceId, projectId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+  runCase             TestRunCase?       @relation(fields: [workspaceId, projectId, testRunCaseId], references: [workspaceId, projectId, id], onDelete: NoAction, onUpdate: NoAction)
+  attachments         DefectAttachment[]
+  history             DefectHistoryEvent[]
+
+  @@unique([workspaceId, projectId, id])
+  @@unique([workspaceId, projectId, sequence])
+  @@index([workspaceId, projectId, status])
+  @@index([workspaceId, projectId, testRunCaseId])
+  @@index([workspaceId, projectId, createdAt], map: "defects_dashboard_period_idx")
+  @@index([workspaceId, projectId, environmentId, createdAt], map: "defects_environment_period_idx")
+  @@map("defects")
+}
+
+model DefectHistoryEvent {
+  id               String   @id @db.Char(36)
+  workspaceId      String   @map("workspace_id") @db.Char(36)
+  projectId        String   @map("project_id") @db.Char(36)
+  defectId         String   @map("defect_id") @db.Char(36)
+  type             String   @db.VarChar(20)
+  actorUserId      String?  @map("actor_user_id") @db.Char(36)
+  actorDisplayName String?  @map("actor_display_name") @db.VarChar(100)
+  createdAt        DateTime @map("created_at") @db.DateTime(3)
+  fromStatus       String?  @map("from_status") @db.VarChar(20)
+  toStatus         String?  @map("to_status") @db.VarChar(20)
+  comment          String?  @db.Text
+  defect           Defect   @relation(fields: [workspaceId, projectId, defectId], references: [workspaceId, projectId, id], onDelete: Restrict, onUpdate: NoAction, map: "defect_history_defect_fk")
+
+  @@index([workspaceId, projectId, defectId, createdAt, id], map: "defect_history_list_idx")
+  @@map("defect_history_events")
+}
+
+model DefectAttachment {
+  id           String     @id @db.Char(36)
+  workspaceId  String     @map("workspace_id") @db.Char(36)
+  projectId    String     @map("project_id") @db.Char(36)
+  defectId     String     @map("defect_id") @db.Char(36)
+  attachmentId String     @map("attachment_id") @db.Char(36)
+  defect       Defect     @relation(fields: [workspaceId, projectId, defectId], references: [workspaceId, projectId, id], onDelete: Restrict, onUpdate: NoAction)
+  attachment   Attachment @relation(fields: [workspaceId, attachmentId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([workspaceId, defectId, attachmentId])
+  @@map("defect_attachments")
+}
+
+model GovernanceFramework {
+  id           String              @id @db.Char(36)
+  workspaceId  String              @map("workspace_id") @db.Char(36)
+  code         String              @db.VarChar(50)
+  name         String              @db.VarChar(100)
+  versionLabel String              @map("version_label") @db.VarChar(50)
+  description  String?             @db.Text
+  status       String              @db.VarChar(30)
+  version      Int
+  createdAt    DateTime            @map("created_at") @db.DateTime(3)
+  updatedAt    DateTime            @map("updated_at") @db.DateTime(3)
+  workspace    Workspace           @relation(fields: [workspaceId], references: [id], onDelete: Restrict, onUpdate: NoAction, map: "governance_frameworks_fk_0")
+  sections     FrameworkSection[]
+  controls     GovernanceControl[]
+  assessments  Assessment[]
+  goals        GovernanceGoal[]
+
+  @@unique([workspaceId, id], map: "governance_frameworks_scope_5")
+  @@unique([workspaceId, code], map: "governance_frameworks_scope_6")
+  @@map("governance_frameworks")
+}
+
+model FrameworkSection {
+  id              String              @id @db.Char(36)
+  workspaceId     String              @map("workspace_id") @db.Char(36)
+  frameworkId     String              @map("framework_id") @db.Char(36)
+  parentSectionId String?             @map("parent_section_id") @db.Char(36)
+  code            String              @db.VarChar(50)
+  name            String              @db.VarChar(100)
+  description     String?             @db.Text
+  position        Int
+  framework       GovernanceFramework @relation(fields: [workspaceId, frameworkId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction, map: "framework_sections_fk_0")
+  parent          FrameworkSection?   @relation("SectionTree", fields: [workspaceId, frameworkId, parentSectionId], references: [workspaceId, frameworkId, id], onDelete: NoAction, onUpdate: NoAction, map: "framework_sections_fk_1")
+  children        FrameworkSection[]  @relation("SectionTree")
+  controls        GovernanceControl[]
+  goals           GovernanceGoal[]
+
+  @@unique([workspaceId, frameworkId, id], map: "framework_sections_scope_4")
+  @@unique([workspaceId, frameworkId, code], map: "framework_sections_scope_5")
+  @@index([workspaceId, frameworkId, parentSectionId], map: "framework_sections_parent_idx")
+  @@map("framework_sections")
+}
+
+model GovernanceControl {
+  creationOrder Int @unique @default(autoincrement()) @map("creation_order")
+  id          String              @id @db.Char(36)
+  workspaceId String              @map("workspace_id") @db.Char(36)
+  frameworkId String              @map("framework_id") @db.Char(36)
+  sectionId   String              @map("section_id") @db.Char(36)
+  code        String              @db.VarChar(50)
+  title       String              @db.VarChar(250)
+  description String?             @db.Text
+  weight      Int
+  active      Boolean
+  framework   GovernanceFramework @relation(fields: [workspaceId, frameworkId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction, map: "governance_controls_fk_0")
+  section     FrameworkSection    @relation(fields: [workspaceId, frameworkId, sectionId], references: [workspaceId, frameworkId, id], onDelete: Restrict, onUpdate: NoAction, map: "governance_controls_fk_1")
+  results     ControlAssessment[]
+
+  @@unique([workspaceId, frameworkId, id], map: "governance_controls_scope_3")
+  @@unique([workspaceId, frameworkId, code], map: "governance_controls_scope_4")
+  @@index([workspaceId, frameworkId, sectionId], map: "governance_controls_section_idx")
+  @@index([workspaceId,frameworkId,creationOrder],map:"governance_controls_creation_idx")
+  @@map("governance_controls")
+}
+
+model Assessment {
+  id                String              @id @db.Char(36)
+  workspaceId       String              @map("workspace_id") @db.Char(36)
+  frameworkId       String              @map("framework_id") @db.Char(36)
+  name              String              @db.VarChar(100)
+  status            String              @db.VarChar(30)
+  assessmentDate    DateTime            @map("assessment_date") @db.Date
+  frameworkSnapshot Json                @map("framework_snapshot")
+  closedAt          DateTime?           @map("closed_at") @db.DateTime(3)
+  createdBy         String              @map("created_by") @db.Char(36)
+  version           Int
+  createdAt         DateTime            @map("created_at") @db.DateTime(3)
+  updatedAt         DateTime            @map("updated_at") @db.DateTime(3)
+  framework         GovernanceFramework @relation(fields: [workspaceId, frameworkId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction, map: "assessments_fk_0")
+  controls          ControlAssessment[]
+
+  @@unique([workspaceId, frameworkId, id], map: "assessments_scope_2")
+  @@unique([workspaceId, id], map: "assessments_scope_3")
+  @@index([workspaceId, frameworkId, status], map: "assessments_scope_4")
+  @@map("assessments")
+}
+
+model ControlAssessment {
+  id              String            @id @db.Char(36)
+  workspaceId     String            @map("workspace_id") @db.Char(36)
+  frameworkId     String            @map("framework_id") @db.Char(36)
+  assessmentId    String            @map("assessment_id") @db.Char(36)
+  controlId       String            @map("control_id") @db.Char(36)
+  controlSnapshot Json              @map("control_snapshot")
+  status          String            @db.VarChar(30)
+  score           Int?
+  justification   String?           @db.Text
+  assessedBy      String?           @map("assessed_by") @db.Char(36)
+  assessedAt      DateTime?         @map("assessed_at") @db.DateTime(3)
+  assessment      Assessment        @relation(fields: [workspaceId, frameworkId, assessmentId], references: [workspaceId, frameworkId, id], onDelete: Restrict, onUpdate: NoAction, map: "control_assessments_fk_0")
+  control         GovernanceControl @relation(fields: [workspaceId, frameworkId, controlId], references: [workspaceId, frameworkId, id], onDelete: Restrict, onUpdate: NoAction, map: "control_assessments_fk_1")
+  evidence        EvidenceLink[]
+  actions         ActionPlan[]
+
+  @@unique([workspaceId, id], map: "control_assessments_scope_4")
+  @@unique([workspaceId, assessmentId, controlId], map: "control_assessments_scope_5")
+  @@index([workspaceId, frameworkId, assessmentId], map: "control_assessments_assessment_idx")
+  @@index([workspaceId, frameworkId, controlId], map: "control_assessments_control_idx")
+  @@map("control_assessments")
+}
+
+model EvidenceLink {
+  id                  String            @id @db.Char(36)
+  workspaceId         String            @map("workspace_id") @db.Char(36)
+  controlAssessmentId String            @map("control_assessment_id") @db.Char(36)
+  evidenceType        String            @map("evidence_type") @db.VarChar(30)
+  referenceId         String?           @map("reference_id") @db.Char(36)
+  url                 String?           @db.VarChar(2048)
+  title               String            @db.VarChar(250)
+  validUntil          DateTime?         @map("valid_until") @db.Date
+  attachmentSnapshot  Json?             @map("attachment_snapshot")
+  createdBy           String            @map("created_by") @db.Char(36)
+  createdAt           DateTime          @map("created_at") @db.DateTime(3)
+  controlAssessment   ControlAssessment @relation(fields: [workspaceId, controlAssessmentId], references: [workspaceId, id], onDelete: Restrict, onUpdate: NoAction, map: "evidence_links_fk_0")
+  attachment          Attachment?       @relation(fields: [workspaceId, referenceId], references: [workspaceId, id], onDelete: NoAction, onUpdate: NoAction, map: "evidence_links_fk_1")
+
+  @@index([workspaceId, controlAssessmentId], map: "evidence_links_scope_2")
+  @@index([workspaceId, referenceId], map: "evidence_links_attachment_idx")
+  @@map("evidence_links")
+}
+
+model GovernanceGoal {
+  id            String               @id @db.Char(36)
+  workspaceId   String               @map("workspace_id") @db.Char(36)
+  projectId     String?              @map("project_id") @db.Char(36)
+  frameworkId   String?              @map("framework_id") @db.Char(36)
+  sectionId     String?              @map("section_id") @db.Char(36)
+  ownerMemberId String?              @map("owner_member_id") @db.Char(36)
+  name          String               @db.VarChar(100)
+  description   String?              @db.Text
+  goalType      String               @map("goal_type") @db.VarChar(30)
+  operator      String               @db.VarChar(30)
+  targetValue   Float                @map("target_value")
+  deadline      DateTime?            @db.Date
+  status        String               @db.VarChar(30)
+  lastResult    Json?                @map("last_result")
+  createdBy     String               @map("created_by") @db.Char(36)
+  version       Int
+  createdAt     DateTime             @map("created_at") @db.DateTime(3)
+  updatedAt     DateTime             @map("updated_at") @db.DateTime(3)
+  workspace     Workspace            @relation(fields: [workspaceId], references: [id], onDelete: Restrict, onUpdate: NoAction, map: "governance_goals_fk_0")
+  project       Project?             @relation(fields: [workspaceId, projectId], references: [workspaceId, id], onDelete: NoAction, onUpdate: NoAction, map: "governance_goals_fk_1")
+  framework     GovernanceFramework? @relation(fields: [workspaceId, frameworkId], references: [workspaceId, id], onDelete: NoAction, onUpdate: NoAction, map: "governance_goals_fk_2")
+  section       FrameworkSection?    @relation(fields: [workspaceId, frameworkId, sectionId], references: [workspaceId, frameworkId, id], onDelete: NoAction, onUpdate: NoAction, map: "governance_goals_section_fk")
+  owner         WorkspaceMember?     @relation(fields: [workspaceId, ownerMemberId], references: [workspaceId, id], onDelete: NoAction, onUpdate: NoAction, map: "governance_goals_owner_fk")
+  actions       ActionPlan[]
+
+  @@unique([workspaceId, id], map: "governance_goals_scope_4")
+  @@index([workspaceId, projectId, status], map: "governance_goals_scope_5")
+  @@index([workspaceId, frameworkId], map: "governance_goals_framework_idx")
+  @@index([workspaceId, frameworkId, sectionId], map: "governance_goals_section_idx")
+  @@index([workspaceId, ownerMemberId], map: "governance_goals_owner_idx")
+  @@map("governance_goals")
+}
+
+model ActionPlan {
+  id                  String             @id @db.Char(36)
+  workspaceId         String             @map("workspace_id") @db.Char(36)
+  controlAssessmentId String?            @map("control_assessment_id") @db.Char(36)
+  goalId              String?            @map("goal_id") @db.Char(36)
+  title               String             @db.VarChar(250)
+  description         String?            @db.Text
+  ownerMemberId       String?            @map("owner_member_id") @db.Char(36)
+  status              String             @db.VarChar(30)
+  dueDate             DateTime?          @map("due_date") @db.Date
+  completedAt         DateTime?          @map("completed_at") @db.DateTime(3)
+  createdBy           String             @map("created_by") @db.Char(36)
+  version             Int
+  createdAt           DateTime           @map("created_at") @db.DateTime(3)
+  updatedAt           DateTime           @map("updated_at") @db.DateTime(3)
+  workspace           Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Restrict, onUpdate: NoAction, map: "action_plans_fk_0")
+  controlAssessment   ControlAssessment? @relation(fields: [workspaceId, controlAssessmentId], references: [workspaceId, id], onDelete: NoAction, onUpdate: NoAction, map: "action_plans_fk_1")
+  goal                GovernanceGoal?    @relation(fields: [workspaceId, goalId], references: [workspaceId, id], onDelete: NoAction, onUpdate: NoAction, map: "action_plans_fk_2")
+  owner               WorkspaceMember?   @relation(fields: [workspaceId, ownerMemberId], references: [workspaceId, id], onDelete: NoAction, onUpdate: NoAction, map: "action_plans_fk_3")
+
+  @@index([workspaceId, status], map: "action_plans_scope_4")
+  @@index([workspaceId, controlAssessmentId], map: "action_plans_control_idx")
+  @@index([workspaceId, goalId], map: "action_plans_goal_idx")
+  @@index([workspaceId, ownerMemberId], map: "action_plans_owner_idx")
+  @@map("action_plans")
+}
+
+model TestCaseImport {
+  id String @id @db.Char(36)
+  workspaceId String @map("workspace_id") @db.Char(36)
+  projectId String @map("project_id") @db.Char(36)
+  fileHash String @map("file_hash") @db.Char(64)
+  cases Json
+  createdBy String @map("created_by") @db.Char(36)
+  createdAt DateTime @map("created_at") @db.DateTime(3)
+  project Project @relation(fields:[workspaceId,projectId],references:[workspaceId,id],onDelete:Restrict,onUpdate:NoAction)
+  @@unique([workspaceId,projectId,fileHash])
+  @@map("test_case_imports")
+}
+
+model TestVaultEntry {
+  id String @id @db.Char(36)
+  workspaceId String @map("workspace_id") @db.Char(36)
+  projectId String @map("project_id") @db.Char(36)
+  environmentId String? @map("environment_id") @db.Char(36)
+  name String @db.VarChar(100)
+  encryptedPayload String @map("encrypted_payload") @db.LongText
+  keyId String @map("key_id") @db.VarChar(50)
+  version Int
+  createdBy String @map("created_by") @db.Char(36)
+  createdAt DateTime @map("created_at") @db.DateTime(3)
+  updatedAt DateTime @map("updated_at") @db.DateTime(3)
+  deletedAt DateTime? @map("deleted_at") @db.DateTime(3)
+  project Project @relation(fields:[workspaceId,projectId],references:[workspaceId,id],onDelete:Restrict,onUpdate:NoAction)
+  environment Environment? @relation(fields:[workspaceId,projectId,environmentId],references:[workspaceId,projectId,id],onDelete:Restrict,onUpdate:NoAction)
+  @@unique([workspaceId,projectId,id])
+  @@index([workspaceId,projectId,deletedAt,name])
+  @@index([workspaceId,projectId,environmentId])
+  @@map("test_vault_entries")
+}
+
+model TestResultImport {
+  id             String    @id @db.Char(36)
+  workspaceId    String    @map("workspace_id") @db.Char(36)
+  projectId      String    @map("project_id") @db.Char(36)
+  testRunId      String    @map("test_run_id") @db.Char(36)
+  runVersion     Int       @map("run_version")
+  fileName       String    @map("file_name") @db.VarChar(250)
+  fileHash       String    @map("file_hash") @db.Char(64)
+  items          Json
+  createdBy      String    @map("created_by") @db.Char(36)
+  createdAt      DateTime  @map("created_at") @db.DateTime(3)
+  expiresAt      DateTime  @map("expires_at") @db.DateTime(3)
+  requestKey     String?   @map("request_key") @db.Char(36)
+  requestHash    String?   @map("request_hash") @db.Char(64)
+  appliedAt      DateTime? @map("applied_at") @db.DateTime(3)
+  appliedVersion Int?      @map("applied_version")
+  mappings       Json?
+  run            TestRun   @relation(fields: [workspaceId, projectId, testRunId], references: [workspaceId, projectId, id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([workspaceId, projectId, testRunId, requestKey], map: "result_imports_request_key")
+  @@index([workspaceId, projectId, testRunId, createdBy], map: "result_imports_scope_idx")
+  @@map("test_result_imports")
+}

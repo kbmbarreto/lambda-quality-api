@@ -1,0 +1,55 @@
+name: lambdaquality-hml
+
+x-container: &container
+  env_file:
+    - path: ${LAMBDAQUALITY_ENV_FILE:?Informe o api.env provisionado no servidor}
+      format: raw
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  volumes:
+    - type: bind
+      source: ${LAMBDAQUALITY_SECRETS_DIRECTORY:?Informe a pasta de chaves do servidor}
+      target: /run/secrets
+      read_only: true
+      bind:
+        create_host_path: false
+  extra_hosts:
+    - host.docker.internal:host-gateway
+  networks: [backend]
+
+services:
+  api:
+    <<: *container
+    image: ${LAMBDAQUALITY_API_IMAGE:?Informe a imagem validada da API}
+    pull_policy: never
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3000"
+      SWAGGER_ENABLED: "false"
+      JWT_PRIVATE_KEY_PATH: /run/secrets/jwt_private.pem
+      JWT_PUBLIC_KEY_PATH: /run/secrets/jwt_public.pem
+      LAMBDAQUALITY_STORAGE_ORACLE_PRIVATE_KEY_PATH: /run/secrets/oci_api_key.pem
+    ports:
+      - "${LAMBDAQUALITY_BIND_ADDRESS:-127.0.0.1}:${LAMBDAQUALITY_HTTP_PORT:-3000}:3000"
+    stop_grace_period: 30s
+    pids_limit: 256
+
+  migrations:
+    <<: *container
+    image: ${LAMBDAQUALITY_MIGRATIONS_IMAGE:?Informe a imagem de migrations}
+    pull_policy: never
+    profiles: [migrate]
+    restart: "no"
+    environment:
+      NODE_ENV: production
+
+networks:
+  backend:
+    external: true
+    name: ${LAMBDAQUALITY_DOCKER_NETWORK:-proxy}

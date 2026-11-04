@@ -1,0 +1,73 @@
+{
+  "name": "lambdaquality-api",
+  "version": "0.1.0",
+  "private": true,
+  "overrides": {
+    "mariadb": "$mariadb",
+    "mysql2": "3.24.5",
+    "deepmerge-ts": "8.0.2",
+    "js-yaml": "5.4.2"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "scripts": {
+    "build": "prisma generate && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "start": "node dist/main.js",
+    "start:dev": "node --watch dist/main.js",
+    "setup:keys": "node scripts/setup-keys.mjs",
+    "db:check": "node scripts/db-check.mjs",
+    "migration:generate": "prisma migrate dev --create-only",
+    "migration:deploy": "prisma migrate deploy",
+    "migration:status": "prisma migrate status",
+    "attachments:cleanup": "node scripts/cleanup-attachments.mjs",
+    "attachments:migrate-to-oci": "node scripts/migrate-attachments-to-oci.mjs",
+    "attachments:check-oci": "node scripts/check-oci-storage.mjs",
+    "lint": "eslint src test scripts --ignore-pattern src/generated",
+    "format": "prettier --write src test scripts *.json *.ts *.mjs && prisma format",
+    "test": "npm run build && vitest run --project unit",
+    "test:integration": "npm run build && vitest run --project integration",
+    "test:integration:local": "npm run build && node scripts/test-local.mjs",
+    "test:all": "npm run build && vitest run",
+    "setup:vault-key": "node scripts/setup-vault-key.mjs",
+    "vault:check": "node scripts/check-vault-key.mjs"
+  },
+  "dependencies": {
+    "@nestjs/common": "11.2.7",
+    "@nestjs/core": "11.2.7",
+    "@nestjs/platform-express": "11.2.7",
+    "@nestjs/swagger": "11.4.7",
+    "@prisma/adapter-mariadb": "7.10.0",
+    "@prisma/client": "7.10.0",
+    "@sendgrid/mail": "8.1.6",
+    "argon2": "0.45.1",
+    "class-transformer": "0.5.1",
+    "class-validator": "0.15.1",
+    "dotenv": "18.0.5",
+    "helmet": "8.3.0",
+    "jose": "6.2.12",
+    "mariadb": "3.5.4",
+    "oci-common": "2.142.1",
+    "oci-objectstorage": "2.142.1",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2",
+    "saxes": "6.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@testcontainers/mysql": "12.2.0",
+    "@types/express": "5.0.6",
+    "@types/node": "24.19.0",
+    "@types/supertest": "7.2.1",
+    "eslint": "10.11.0",
+    "prettier": "3.9.9",
+    "prisma": "7.10.0",
+    "supertest": "7.3.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.71.0",
+    "vitest": "5.0.3"
+  },
+  "license": "MIT"
+}
